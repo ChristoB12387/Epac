@@ -27,6 +27,9 @@
   input[type=date] { -webkit-appearance: none; appearance: none; display: block; min-height: 48px; min-width: 0; max-width: 100%; text-align: left; }
   input[type=date]::-webkit-date-and-time-value { text-align: left; }
   @media (max-width: 480px) { .grid > label.wide { grid-column: 1 / -1; } }
+  .att-grid { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap: 10px; }
+  .att-grid > label { min-width: 0; }
+  .att-grid > .att-tq { grid-column: 1 / -1; }
   .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
   button { font: inherit; padding: 10px 16px; border-radius: 999px; border: 1px solid var(--accent); background: var(--accent); color: #06121f; font-weight: 600; cursor: pointer; }
   button.ghost { background: transparent; color: var(--accent); }
@@ -83,8 +86,8 @@
 <template id="tpl-attempt">
   <div class="card attempt">
     <h2 class="att-title">1st attempt</h2>
-    <div class="grid">
-      <label>TQ indicated (%)<input class="tq" type="number" inputmode="decimal" placeholder="e.g. 78"></label>
+    <div class="att-grid">
+      <label class="att-tq">TQ indicated (%)<input class="tq" type="number" inputmode="decimal" placeholder="e.g. 78"></label>
       <label>ITT ENG #1 (°C)<input class="itt1" type="number" inputmode="decimal" placeholder="e.g. 760"></label>
       <label>ITT ENG #2 (°C)<input class="itt2" type="number" inputmode="decimal" placeholder="e.g. 755"></label>
     </div>
