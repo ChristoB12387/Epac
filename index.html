@@ -56,6 +56,8 @@
   .caution { border-color: var(--warn); }
   details summary { cursor: pointer; color: var(--accent); margin-top: 10px; }
   svg { width: 100%; height: auto; background: #0b1526; border: 1px solid var(--line); border-radius: 8px; margin-top: 8px; }
+  .cond { grid-template-columns: repeat(auto-fit, minmax(90px, 1fr)); margin-bottom: 10px; padding-bottom: 12px; border-bottom: 1px solid var(--line); }
+  .cond > label { min-width: 0; justify-content: flex-end; }
   .att-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 10px; }
   .att-head h2 { margin: 0; }
   .sheet { position: fixed; inset: 0; background: rgba(4,10,20,.88); z-index: 50; overflow-y: auto; -webkit-overflow-scrolling: touch; padding: calc(12px + env(safe-area-inset-top)) 12px calc(24px + env(safe-area-inset-bottom)); }
@@ -97,8 +99,10 @@
     <div class="grid">
       <label class="wide">Date<input id="date" type="date"></label>
       <label class="wide">A/C tail number<input id="tail" type="text" placeholder="A7-GAB" autocapitalize="characters"></label>
+    </div>
+    <div class="grid cond" id="cond">
       <label id="ias-wrap">IAS (kt)<input id="ias" type="number" inputmode="decimal" value="120"></label>
-      <label>P ALT (ft, 1013 set)<input id="palt" type="number" inputmode="numeric" placeholder="e.g. 1500"></label>
+      <label>P ALT (ft)<input id="palt" type="number" inputmode="numeric" placeholder="e.g. 1500"></label>
       <label>OAT (°C)<input id="oat" type="number" inputmode="decimal" placeholder="e.g. 28"></label>
     </div>
   </div>
@@ -312,6 +316,7 @@ $('clear').addEventListener('click', () => {
 ['date','tail','ias','palt','oat'].forEach(id => $(id).addEventListener('input', recalc));
 $('date').value = new Date().toISOString().slice(0,10);
 for (let i=0;i<3;i++) makeAttempt(i);
+attempts[0].node.insertBefore($('cond'), attempts[0].node.querySelector('.att-grid'));
 
 // ---------- Saved checks (kept on this phone, works offline) ----------
 const KEY = 'aw189-epac-log';
@@ -915,7 +920,7 @@ const SCAN_TPL = [{"c":"6","a":0,"f":"000000000000000012321100001258886420012688
       });
     }
     $('scangrid').innerHTML = h;
-    $('sheet-use').textContent = `Fills the ${ATT_NAMES[target].toLowerCase()} with the higher TQ and both ITTs, and the flight details with ALT (as P ALT), OAT${MODE === 'hover' ? '' : ' and IAS'} from ENG 1.`;
+    $('sheet-use').textContent = `Fills the ${ATT_NAMES[target].toLowerCase()} with the higher TQ, both ITTs, and ALT (as P ALT), OAT${MODE === 'hover' ? '' : ' and IAS'}.`;
     $('sheet-busy').hidden = true; $('sheet-body').hidden = false; $('sheet-ok').hidden = false;
   });
   $('sheet-ok').addEventListener('click', () => {
