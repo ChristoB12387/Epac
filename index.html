@@ -30,6 +30,11 @@
   .att-grid { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap: 10px; }
   .att-grid > label { min-width: 0; }
   .att-grid > .att-tq { grid-column: 1 / -1; }
+  .loglist { display: flex; flex-direction: column; gap: 8px; }
+  .logitem { background: #0b1526; border: 1px solid var(--line); border-radius: 10px; padding: 10px; font-size: .88rem; font-variant-numeric: tabular-nums; }
+  .logitem .lh { display: flex; justify-content: space-between; gap: 8px; font-weight: 600; margin-bottom: 4px; }
+  .logitem .lm { color: var(--muted); }
+  .logitem .del { background: transparent; border: 0; color: var(--muted); padding: 0 4px; font-size: .85rem; cursor: pointer; }
   .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
   button { font: inherit; padding: 10px 16px; border-radius: 999px; border: 1px solid var(--accent); background: var(--accent); color: #06121f; font-weight: 600; cursor: pointer; }
   button.ghost { background: transparent; color: var(--accent); }
@@ -78,7 +83,22 @@
 
   <div id="attempts"></div>
 
-  <div class="row" style="margin:12px 0"><button id="clear" class="ghost">New check</button></div>
+  <div class="row" style="margin:12px 0">
+    <button id="save">Save this check</button>
+    <button id="clear" class="ghost">New check</button>
+  </div>
+  <div class="note" id="savemsg" aria-live="polite"></div>
+
+  <div class="card">
+    <h2>Saved checks (on this phone)</h2>
+    <div class="note" style="margin-bottom:8px">Kept on this phone and works offline. Use Export to save a copy to Files, iCloud Drive or email.</div>
+    <div id="log"><span class="note">None saved yet.</span></div>
+    <div class="row" style="margin-top:10px">
+      <button id="export" class="ghost small">Export log (CSV)</button>
+      <button id="wipe" class="ghost small">Delete all</button>
+    </div>
+    <div class="note" id="logmsg" aria-live="polite"></div>
+  </div>
 
   <div class="note">Method: Corrected TQ from Fig 4-5 by interpolating between the altitude lines. MAX ITT from Fig 4-10 (−1000 to below 2000 ft) or Fig 4-11 (2000 to 5000 ft), interpolating between the OAT curves. At exactly 2000 ft both charts apply and the lower (more conservative) MAX ITT is used. PAC margin = MAX ITT − engine ITT; acceptable when greater than 0.</div>
 </main>
@@ -247,6 +267,68 @@ $('clear').addEventListener('click', () => {
 ['date','tail','ias','palt','oat'].forEach(id => $(id).addEventListener('input', recalc));
 $('date').value = new Date().toISOString().slice(0,10);
 for (let i=0;i<3;i++) makeAttempt(i);
+
+// ---------- Saved checks (kept on this phone, works offline) ----------
+const KEY = 'aw189-epac-log';
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function loadLog() { try { const v = JSON.parse(localStorage.getItem(KEY) || '[]'); return Array.isArray(v) ? v : []; } catch (e) { return []; } }
+function storeLog(l) { try { localStorage.setItem(KEY, JSON.stringify(l)); return true; } catch (e) { return false; } }
+try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (e) {}
+const sgn = (m) => (m > 0 ? '+' : '') + m;
+function renderLog() {
+  const l = loadLog();
+  if (!l.length) { $('log').innerHTML = '<span class="note">None saved yet.</span>'; return; }
+  $('log').innerHTML = '<div class="loglist">' + l.slice().reverse().map((e) => {
+    const rows = e.attempts.map((a) => `<div>${esc(a.name)}: TQ ${esc(a.tq)} → ${esc(a.corr)} % · MAX ITT ${esc(a.mitt)} · ITT ${esc(a.itt1)} / ${esc(a.itt2)} · margins <span class="${a.m1>0?'pass':'fail'}">${esc(sgn(a.m1))}</span> / <span class="${a.m2>0?'pass':'fail'}">${esc(sgn(a.m2))}</span></div>`).join('');
+    return `<div class="logitem"><div class="lh"><span>${esc(e.date)} · ${esc(e.tail || '—')}</span><button class="del" data-id="${esc(e.id)}" aria-label="Delete this check">Delete</button></div>
+      <div class="lm">P ALT ${esc(e.palt)} ft · OAT ${esc(e.oat)} °C · IAS ${esc(e.ias)} kt · Fig ${esc(e.chart)}</div>${rows}</div>`;
+  }).join('') + '</div>';
+  $('log').querySelectorAll('.del').forEach((b) => b.addEventListener('click', () => {
+    if (b.dataset.armed) { storeLog(loadLog().filter((e) => e.id !== b.dataset.id)); renderLog(); return; }
+    b.dataset.armed = '1'; b.textContent = 'Tap again to delete';
+  }));
+}
+$('save').addEventListener('click', () => {
+  const done = attempts.map((a, i) => ({ a, i })).filter(({ a }) => a.res && a.res.m1 !== null && a.res.m2 !== null);
+  if (!done.length) { $('savemsg').textContent = 'Fill in P ALT, OAT, TQ and both ITTs first.'; return; }
+  const l = loadLog();
+  const entry = {
+    id: String(Date.now()), saved: new Date().toISOString(),
+    date: $('date').value, tail: $('tail').value.trim().toUpperCase(), ias: num($('ias')), palt: num($('palt')), oat: num($('oat')),
+    chart: done[0].a.res.chart,
+    attempts: done.map(({ a, i }) => ({ name: ATT_NAMES[i], tq: a.res.I, itt1: a.res.t1, itt2: a.res.t2, corr: r1(a.res.corr), mitt: Math.round(a.res.mitt), m1: Math.round(a.res.m1), m2: Math.round(a.res.m2) }))
+  };
+  l.push(entry);
+  $('savemsg').textContent = storeLog(l) ? 'Saved on this phone.' : 'This phone would not save it. Check that private browsing is off.';
+  renderLog();
+});
+function csvText() {
+  const q = (v) => { const s = String(v ?? ''); return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
+  const head = ['date','tail','ias_kt','palt_ft','oat_c','chart','attempt','tq_ind','itt_eng1','itt_eng2','corr_tq','max_itt','margin_eng1','margin_eng2','saved_at'];
+  const rows = [];
+  loadLog().forEach((e) => e.attempts.forEach((a) => rows.push([e.date, e.tail, e.ias, e.palt, e.oat, 'Fig ' + e.chart, a.name, a.tq, a.itt1, a.itt2, a.corr, a.mitt, a.m1, a.m2, e.saved].map(q).join(','))));
+  return [head.join(',')].concat(rows).join('\n');
+}
+$('export').addEventListener('click', async () => {
+  if (!loadLog().length) { $('logmsg').textContent = 'Nothing saved yet.'; return; }
+  const name = 'EPAC_log_' + new Date().toISOString().slice(0, 10) + '.csv';
+  const file = new File([csvText()], name, { type: 'text/csv' });
+  try {
+    if (navigator.canShare && navigator.canShare({ files: [file] })) { await navigator.share({ files: [file], title: name }); $('logmsg').textContent = ''; return; }
+  } catch (e) { if (e && e.name === 'AbortError') return; }
+  try {
+    const u = URL.createObjectURL(file); const a = document.createElement('a'); a.href = u; a.download = name;
+    document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(u), 5000);
+    $('logmsg').textContent = 'Log file created: ' + name;
+  } catch (e) { $('logmsg').textContent = 'Could not create the file on this phone.'; }
+});
+$('wipe').addEventListener('click', () => {
+  const b = $('wipe');
+  if (b.dataset.armed) { storeLog([]); renderLog(); b.textContent = 'Delete all'; delete b.dataset.armed; $('logmsg').textContent = 'All saved checks deleted.'; return; }
+  b.dataset.armed = '1'; b.textContent = 'Tap again to delete everything';
+  setTimeout(() => { if (b.dataset.armed) { delete b.dataset.armed; b.textContent = 'Delete all'; } }, 5000);
+});
+renderLog();
 recalc();
 </script>
 <script>if ('serviceWorker' in navigator) { window.addEventListener('load', () => { navigator.serviceWorker.register('sw.js').catch(() => {}); }); }</script>
