@@ -56,6 +56,18 @@
   .caution { border-color: var(--warn); }
   details summary { cursor: pointer; color: var(--accent); margin-top: 10px; }
   svg { width: 100%; height: auto; background: #0b1526; border: 1px solid var(--line); border-radius: 8px; margin-top: 8px; }
+  .att-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 10px; }
+  .att-head h2 { margin: 0; }
+  .sheet { position: fixed; inset: 0; background: rgba(4,10,20,.88); z-index: 50; overflow-y: auto; -webkit-overflow-scrolling: touch; padding: calc(12px + env(safe-area-inset-top)) 12px calc(24px + env(safe-area-inset-bottom)); }
+  .sheet .panel { max-width: 640px; margin: 0 auto; background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 14px; }
+  .scangrid { display: grid; grid-template-columns: auto minmax(0,1fr) minmax(0,1fr); gap: 8px 8px; align-items: center; margin: 10px 0; }
+  .scangrid .hd { font-size: .8rem; color: var(--muted); font-weight: 600; text-align: center; }
+  .scangrid .rk { font-weight: 700; font-size: .9rem; }
+  .scell { display: flex; flex-direction: column; gap: 4px; background: #0b1526; border: 1px solid var(--line); border-radius: 8px; padding: 5px; }
+  .scell img { width: 100%; height: auto; border-radius: 4px; background: #000; }
+  .scell input { font-size: 1.1rem; padding: 6px 8px; text-align: center; }
+  .scell.chk { border-color: var(--warn); box-shadow: 0 0 0 1px var(--warn) inset; }
+  .scell.chk input { border-color: var(--warn); }
   table { width: 100%; border-collapse: collapse; font-size: .85rem; font-variant-numeric: tabular-nums; }
   th, td { padding: 6px 4px; border-bottom: 1px solid var(--line); text-align: right; }
   th:first-child, td:first-child { text-align: left; }
@@ -113,9 +125,29 @@
   <div class="note">Method: Corrected TQ from Fig 4-5 by interpolating between the altitude lines. Level flight: MAX ITT from Fig 4-10 (−1000 to below 2000 ft) or Fig 4-11 (2000 to 5000 ft). Hover: MAX ITT from Fig 4-6 (−1000 to 2000 ft). Both interpolate between the OAT curves. At exactly 2000 ft both charts apply and the lower (more conservative) MAX ITT is used. PAC margin = MAX ITT − engine ITT; acceptable when greater than 0.</div>
 </main>
 
+
+<input type="file" id="scanfile" accept="image/*" capture="environment" hidden>
+<div class="sheet" id="sheet" hidden>
+  <div class="panel">
+    <h2 id="sheet-title">Check the readings</h2>
+    <div class="note" id="sheet-busy">Reading the photo…</div>
+    <div class="msg" id="sheet-err" hidden></div>
+    <div id="sheet-body" hidden>
+      <div class="note">Compare every number with the picture next to it and correct any that are wrong. Amber boxes are the ones the app is least sure of.</div>
+      <div class="scangrid" id="scangrid"></div>
+      <div class="note" id="sheet-use"></div>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <button type="button" id="sheet-ok" hidden>Use these values</button>
+      <button type="button" id="sheet-retake" class="ghost">Take another photo</button>
+      <button type="button" id="sheet-cancel" class="ghost">Cancel</button>
+    </div>
+  </div>
+</div>
+
 <template id="tpl-attempt">
   <div class="card attempt">
-    <h2 class="att-title">1st attempt</h2>
+    <div class="att-head"><h2 class="att-title">1st attempt</h2><button type="button" class="ghost small scanbtn">📷 Scan display</button></div>
     <div class="att-grid">
       <label class="att-tq">TQ indicated (%)<input class="tq" type="number" inputmode="decimal" placeholder="e.g. 78"></label>
       <label>ITT ENG #1 (°C)<input class="itt1" type="number" inputmode="decimal" placeholder="e.g. 760"></label>
@@ -356,6 +388,495 @@ function setMode(m) {
 }
 document.querySelectorAll('.tab').forEach((b) => b.addEventListener('click', () => setMode(b.dataset.mode)));
 setMode(MODE);
+</script>
+
+<script>
+// AW189 PWR CHECK display reader.
+// Finds the two white-bordered PWR CHECK boxes (TQ, ITT, NG, IAS, ALT, OAT)
+// in a photo of the MFD, straightens each one, and reads the green values.
+const Scan = (() => {
+  const ROWS = ['TQ', 'ITT', 'NG', 'IAS', 'ALT', 'OAT'];
+  const RW = 260, RH = 312;            // straightened table size (6 rows of 52 px)
+  const GW = 12, GH = 16;              // glyph feature grid
+
+  // ---------- image helpers ----------
+  function toCanvas(img, maxDim) {
+    const s = Math.min(1, maxDim / Math.max(img.width, img.height));
+    const c = document.createElement('canvas');
+    c.width = Math.round(img.width * s); c.height = Math.round(img.height * s);
+    c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+    return c;
+  }
+
+  // white / light grey, low saturation (table lines and labels)
+  function whiteMask(d, w, h) {
+    const m = new Uint8Array(w * h);
+    for (let i = 0, p = 0; i < m.length; i++, p += 4) {
+      const r = d[p], g = d[p + 1], b = d[p + 2];
+      const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
+      if (mn >= 130 && mx - mn <= 70) m[i] = 1;
+    }
+    return m;
+  }
+
+  function components(m, w, h, minPix) {
+    const lab = new Int32Array(w * h), out = [], stack = new Int32Array(w * h);
+    let id = 0;
+    for (let s = 0; s < m.length; s++) {
+      if (!m[s] || lab[s]) continue;
+      id++; let sp = 0; stack[sp++] = s; lab[s] = id;
+      let n = 0, x0 = w, y0 = h, x1 = 0, y1 = 0;
+      let tl = [0, 0, Infinity], br = [0, 0, -Infinity], tr = [0, 0, -Infinity], bl = [0, 0, Infinity];
+      while (sp) {
+        const q = stack[--sp], x = q % w, y = (q - x) / w; n++;
+        if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+        if (x + y < tl[2]) tl = [x, y, x + y]; if (x + y > br[2]) br = [x, y, x + y];
+        if (x - y > tr[2]) tr = [x, y, x - y]; if (x - y < bl[2]) bl = [x, y, x - y];
+        for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+          const nx = x + dx, ny = y + dy;
+          if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+          const t = ny * w + nx;
+          if (m[t] && !lab[t]) { lab[t] = id; stack[sp++] = t; }
+        }
+      }
+      if (n >= minPix) out.push({ id, n, x0, y0, x1, y1, w: x1 - x0 + 1, h: y1 - y0 + 1, tl, tr, br, bl });
+    }
+    return out;
+  }
+
+  // homography mapping 4 points p (dst) -> q (src)
+  function homography(p, q) {
+    const A = [], B = [];
+    for (let i = 0; i < 4; i++) {
+      const [x, y] = p[i], [u, v] = q[i];
+      A.push([x, y, 1, 0, 0, 0, -u * x, -u * y]); B.push(u);
+      A.push([0, 0, 0, x, y, 1, -v * x, -v * y]); B.push(v);
+    }
+    // gaussian elimination
+    const n = 8;
+    for (let c = 0; c < n; c++) {
+      let piv = c;
+      for (let r = c + 1; r < n; r++) if (Math.abs(A[r][c]) > Math.abs(A[piv][c])) piv = r;
+      [A[c], A[piv]] = [A[piv], A[c]]; [B[c], B[piv]] = [B[piv], B[c]];
+      for (let r = 0; r < n; r++) if (r !== c) {
+        const f = A[r][c] / A[c][c];
+        for (let k = c; k < n; k++) A[r][k] -= f * A[c][k];
+        B[r] -= f * B[c];
+      }
+    }
+    const hv = B.map((b, i) => b / A[i][i]);
+    return [...hv, 1];
+  }
+
+  function warp(d, w, h, H, W2, H2) {
+    const out = new Uint8ClampedArray(W2 * H2 * 4);
+    for (let y = 0; y < H2; y++) for (let x = 0; x < W2; x++) {
+      const z = H[6] * x + H[7] * y + H[8];
+      const sx = (H[0] * x + H[1] * y + H[2]) / z, sy = (H[3] * x + H[4] * y + H[5]) / z;
+      const ix = Math.floor(sx), iy = Math.floor(sy), fx = sx - ix, fy = sy - iy;
+      const o = (y * W2 + x) * 4;
+      if (ix < 0 || iy < 0 || ix >= w - 1 || iy >= h - 1) { out[o + 3] = 255; continue; }
+      for (let c = 0; c < 3; c++) {
+        const a = d[(iy * w + ix) * 4 + c], b = d[(iy * w + ix + 1) * 4 + c];
+        const e = d[((iy + 1) * w + ix) * 4 + c], f = d[((iy + 1) * w + ix + 1) * 4 + c];
+        out[o + c] = (a * (1 - fx) + b * fx) * (1 - fy) + (e * (1 - fx) + f * fx) * fy;
+      }
+      out[o + 3] = 255;
+    }
+    return out;
+  }
+
+  // groups of consecutive indices where prof[i] >= thr -> centres
+  function peaks(prof, thr) {
+    const c = []; let s = -1;
+    for (let i = 0; i <= prof.length; i++) {
+      const on = i < prof.length && prof[i] >= thr;
+      if (on && s < 0) s = i;
+      if (!on && s >= 0) { c.push((s + i - 1) / 2); s = -1; }
+    }
+    return c;
+  }
+
+  // ---------- table detection ----------
+  function findTables(cv) {
+    const w = cv.width, h = cv.height;
+    const d = cv.getContext('2d').getImageData(0, 0, w, h).data;
+    const m = whiteMask(d, w, h);
+    const comps = components(m, w, h, 150);
+    const cands = [];
+    for (const c of comps) {
+      if (c.w < w * 0.04 || c.w > w * 0.3) continue;
+      const ar = c.h / c.w;
+      if (ar < 0.8 || ar > 1.8) continue;
+      if (c.n / (c.w * c.h) > 0.35) continue;
+      const src = [[c.tl[0], c.tl[1]], [c.tr[0], c.tr[1]], [c.br[0], c.br[1]], [c.bl[0], c.bl[1]]];
+      const H = homography([[0, 0], [RW - 1, 0], [RW - 1, RH - 1], [0, RH - 1]], src);
+      const px = warp(d, w, h, H, RW, RH);
+      const wm = whiteMask(px, RW, RH);
+      const rowP = new Float32Array(RH), colP = new Float32Array(RW);
+      for (let y = 0; y < RH; y++) for (let x = 0; x < RW; x++) if (wm[y * RW + x]) { rowP[y]++; colP[x]++; }
+      for (let y = 0; y < RH; y++) rowP[y] /= RW;
+      for (let x = 0; x < RW; x++) colP[x] /= RH;
+      let hl = peaks(rowP, 0.55);
+      // merge peaks closer than 10 px
+      hl = hl.filter((v, i) => i === 0 || v - hl[i - 1] > 10);
+      let dv = -1, dvv = 0.5;
+      for (let x = Math.round(RW * 0.3); x < RW * 0.6; x++) if (colP[x] > dvv) { dvv = colP[x]; dv = x; }
+      const vl = dv >= 0 ? [dv] : [];
+      // need the horizontal grid lines and the label/value divider
+      if (hl.length < 5 || !vl.length) continue;
+      // green content on the value side
+      let green = 0;
+      for (let i = 0, p = 0; i < RW * RH; i++, p += 4) if (px[p + 1] - Math.max(px[p], px[p + 2]) > 40) green++;
+      if (green < RW * RH * 0.02) continue;
+      cands.push({ c, H, px, hl, div: vl[0], score: hl.length + (green / (RW * RH)), cx: (c.x0 + c.x1) / 2, cy: (c.y0 + c.y1) / 2, area: c.w * c.h });
+    }
+    return cands;
+  }
+
+  function rowBounds(hl) {
+    // use detected lines if we have all 7, otherwise an even split
+    if (hl.length >= 7) {
+      const L = hl.slice(0, 7);
+      // pick the 7 most evenly spaced (just take first 7 after filter)
+      return ROWS.map((_, i) => [L[i], L[i + 1]]);
+    }
+    const step = RH / 6;
+    return ROWS.map((_, i) => [i * step, (i + 1) * step]);
+  }
+
+  // ---------- glyphs ----------
+  function otsu(vals) {
+    const hist = new Float64Array(256); let n = 0;
+    for (const v of vals) { hist[Math.max(0, Math.min(255, v | 0))]++; n++; }
+    let sum = 0; for (let i = 0; i < 256; i++) sum += i * hist[i];
+    let sB = 0, wB = 0, best = 0, thr = 0;
+    for (let t = 0; t < 256; t++) {
+      wB += hist[t]; if (!wB) continue; const wF = n - wB; if (!wF) break;
+      sB += t * hist[t]; const mB = sB / wB, mF = (sum - sB) / wF;
+      const v = wB * wF * (mB - mF) ** 2; if (v > best) { best = v; thr = t; }
+    }
+    return thr;
+  }
+
+  function glyphs(px, x0, x1, y0, y1) {
+    const W = x1 - x0, Hh = y1 - y0;
+    const sc = new Int16Array(W * Hh);
+    for (let y = 0; y < Hh; y++) for (let x = 0; x < W; x++) {
+      const p = ((y + y0) * RW + (x + x0)) * 4;
+      sc[y * W + x] = px[p + 1] - Math.max(px[p], px[p + 2]);
+    }
+    const thr = Math.max(50, Math.min(130, otsu(sc)));
+    const g = new Uint8Array(W * Hh);
+    for (let i = 0; i < g.length; i++) if (sc[i] >= thr) g[i] = 1;
+    // connected components
+    let comps = components(g, W, Hh, 3).map((c) => ({ x0: c.x0, x1: c.x1, y0: c.y0, y1: c.y1, n: c.n }));
+    // merge pieces of the same character (strong horizontal overlap)
+    comps.sort((a, b) => a.x0 - b.x0);
+    const H0 = Math.max(...comps.map((c) => c.y1 - c.y0 + 1), 1);
+    const big = (c) => c.y1 - c.y0 + 1 > 0.4 * H0;
+    const merged = [];
+    for (const c of comps) {
+      const m = !big(c) ? null : merged.find((o) => {
+        if (!big(o)) return false;
+        const ov = Math.min(o.x1, c.x1) - Math.max(o.x0, c.x0) + 1;
+        return ov > 0.5 * Math.min(o.x1 - o.x0 + 1, c.x1 - c.x0 + 1);
+      });
+      if (m) { m.x0 = Math.min(m.x0, c.x0); m.x1 = Math.max(m.x1, c.x1); m.y0 = Math.min(m.y0, c.y0); m.y1 = Math.max(m.y1, c.y1); m.n += c.n; }
+      else merged.push({ ...c });
+    }
+    // split blobs that are several touching digits wide
+    const Hd = Math.max(...merged.map((c) => c.y1 - c.y0 + 1), 1);
+    const out = [];
+    for (const c of merged) {
+      const w = c.x1 - c.x0 + 1, h = c.y1 - c.y0 + 1;
+      const k = h > 0.6 * Hd ? Math.round(w / (0.62 * Hd)) : 1;
+      if (k <= 1) { out.push(c); continue; }
+      // cut at the emptiest columns near each nominal boundary
+      const col = new Float32Array(w);
+      for (let x = 0; x < w; x++) for (let y = c.y0; y <= c.y1; y++) col[x] += g[y * W + c.x0 + x];
+      let prev = 0;
+      for (let j = 1; j <= k; j++) {
+        let cut = w;
+        if (j < k) {
+          const nom = Math.round((j * w) / k), r = Math.round(w / k / 3);
+          let bv = Infinity;
+          for (let x = nom - r; x <= nom + r; x++) if (x > prev && x < w && col[x] < bv) { bv = col[x]; cut = x; }
+        }
+        out.push({ x0: c.x0 + prev, x1: c.x0 + cut - 1, y0: c.y0, y1: c.y1, n: 0 });
+        prev = cut + (j < k ? 0 : 0);
+      }
+    }
+    // tighten vertical extents and count pixels
+    const res = [];
+    for (const c of out) {
+      let ya = Hh, yb = -1, n = 0;
+      for (let x = c.x0; x <= c.x1; x++) for (let y = 0; y < Hh; y++) if (g[y * W + x]) { n++; if (y < ya) ya = y; if (y > yb) yb = y; }
+      if (n < 4) continue;
+      const h = yb - ya + 1;
+      // a decimal point blurred into the next digit: leading columns with ink only near the bottom
+      if (h > 0.6 * Hd) {
+        const lim = ya + 0.62 * h;
+        let run = 0;
+        for (let x = c.x0; x <= c.x1; x++) {
+          let upper = false, any = false;
+          for (let y = ya; y <= yb; y++) if (g[y * W + x]) { any = true; if (y < lim) { upper = true; break; } }
+          if (upper) break;
+          run++;
+        }
+        if (run >= 0.18 * Hd && run < (c.x1 - c.x0 + 1) - 0.25 * Hd) {
+          const d0 = c.x0, d1 = c.x0 + run - 1;
+          let da = Hh, db = -1, dn = 0;
+          for (let x = d0; x <= d1; x++) for (let y = 0; y < Hh; y++) if (g[y * W + x]) { dn++; if (y < da) da = y; if (y > db) db = y; }
+          if (dn) res.push({ x0: d0, x1: d1, y0: da, y1: db, w: run, h: db - da + 1, n: dn, mask: g, W, dot: true });
+          c.x0 = d1 + 1;
+          ya = Hh; yb = -1; n = 0;
+          for (let x = c.x0; x <= c.x1; x++) for (let y = 0; y < Hh; y++) if (g[y * W + x]) { n++; if (y < ya) ya = y; if (y > yb) yb = y; }
+        }
+      }
+      res.push({ x0: c.x0, x1: c.x1, y0: ya, y1: yb, w: c.x1 - c.x0 + 1, h: yb - ya + 1, n, mask: g, W });
+    }
+    return res;
+  }
+
+  // glyph picture in a fixed box: the row's digit band vertically, 0.8 x band wide, centred on the glyph
+  const OPT = { mode: 'pos', dist: 'corr', blur: 1, aw: 0.2, train: false, qmax: 0.8 };
+  function feature(gl, top, bot) {
+    let X0, bw, Y0, bh;
+    if (OPT.mode === 'stretch') { X0 = gl.x0; bw = gl.w; Y0 = gl.y0; bh = gl.h; }
+    else { bh = Math.max(4, bot - top + 1); bw = 0.8 * bh; X0 = (gl.x0 + gl.x1 + 1) / 2 - bw / 2; Y0 = top; }
+    const f = new Float32Array(GW * GH);
+    for (let j = 0; j < GH; j++) for (let i = 0; i < GW; i++) {
+      const xa = X0 + (i * bw) / GW, xb = X0 + ((i + 1) * bw) / GW;
+      const ya = Y0 + (j * bh) / GH, yb = Y0 + ((j + 1) * bh) / GH;
+      let s = 0, c = 0;
+      for (let y = Math.floor(ya); y < Math.ceil(yb); y++) for (let x = Math.floor(xa); x < Math.ceil(xb); x++) {
+        c++;
+        if (x < gl.x0 || x > gl.x1 || y < 0 || y * gl.W >= gl.mask.length) continue;
+        s += gl.mask[y * gl.W + x];
+      }
+      f[j * GW + i] = c ? s / c : 0;
+    }
+    if (!OPT.blur) return f;
+    // light blur so small shifts matter less
+    const b = new Float32Array(GW * GH);
+    for (let j = 0; j < GH; j++) for (let i = 0; i < GW; i++) {
+      let s = 0, c = 0;
+      for (let dj = -1; dj <= 1; dj++) for (let di = -1; di <= 1; di++) {
+        const jj = j + dj, ii = i + di; if (jj < 0 || ii < 0 || jj >= GH || ii >= GW) continue;
+        const wgt = dj || di ? 0.5 : 1; s += wgt * f[jj * GW + ii]; c += wgt;
+      }
+      b[j * GW + i] = s / c;
+    }
+    return b;
+  }
+
+  function morph(mask, W, dil) {
+    const H = mask.length / W, o = new Uint8Array(mask.length);
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+      let v = dil ? 0 : 1;
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        if (Math.abs(dx) + Math.abs(dy) > 1) continue;
+        const xx = x + dx, yy = y + dy;
+        const m = xx < 0 || yy < 0 || xx >= W || yy >= H ? 0 : mask[yy * W + xx];
+        if (dil && m) v = 1; if (!dil && !m) v = 0;
+      }
+      o[y * W + x] = v;
+    }
+    return o;
+  }
+  function variants(gl, top, bot) {
+    const out = [];
+    for (const d of [true, false]) {
+      const m = morph(gl.mask, gl.W, d);
+      out.push(feature({ ...gl, mask: m }, top, bot));
+    }
+    return out;
+  }
+
+  let TPL = [];   // [{c, f, a}]
+  function setTemplates(t) { TPL = t.map((x) => ({ c: x.c, a: x.a, f: typeof x.f === 'string' ? Float32Array.from(x.f, (ch) => (ch.charCodeAt(0) - 48) / 9) : x.f })); }
+
+  function classify(f, aspect) {
+    if (!TPL.length) return { c: '?', d: 1, d2: 1 };
+    const best = {};
+    for (const t of TPL) {
+      let d = 0;
+      if (OPT.dist === 'corr') {
+        let ma = 0, mb = 0; for (let i = 0; i < f.length; i++) { ma += f[i]; mb += t.f[i]; } ma /= f.length; mb /= f.length;
+        let sab = 0, saa = 0, sbb = 0;
+        for (let i = 0; i < f.length; i++) { const a = f[i] - ma, b = t.f[i] - mb; sab += a * b; saa += a * a; sbb += b * b; }
+        d = 1 - sab / Math.sqrt(saa * sbb + 1e-9);
+      } else { for (let i = 0; i < f.length; i++) { const e = f[i] - t.f[i]; d += e * e; } d /= f.length; }
+      d += OPT.aw * (aspect - t.a) ** 2;
+      if (best[t.c] === undefined || d < best[t.c]) best[t.c] = d;
+    }
+    const s = Object.entries(best).sort((a, b) => a[1] - b[1]);
+    return { c: s[0][0], d: s[0][1], d2: s[1] ? s[1][1] : 1 };
+  }
+
+  // turn a row's glyphs into {text, conf, items}
+  function readRow(gls) {
+    if (!gls.length) return { text: '', ok: false, items: [] };
+    const Hd = Math.max(...gls.map((g) => g.h));
+    const top = Math.min(...gls.filter((g) => g.h > 0.6 * Hd).map((g) => g.y0));
+    const bot = Math.max(...gls.filter((g) => g.h > 0.6 * Hd).map((g) => g.y1));
+    const items = [];
+    for (const g of gls) {
+      const cy = (g.y0 + g.y1) / 2, rel = (cy - top) / Math.max(1, bot - top);
+      if (g.dot) { items.push({ c: '.', g, q: 0 }); continue; }
+      if (g.h < 0.4 * Hd) {
+        if (rel > 0.7) items.push({ c: '.', g, q: 0 });
+        else if (rel < 0.35) items.push({ c: 'u', g, q: 0 });
+        else if (g.w > g.h * 1.5) items.push({ c: '-', g, q: 0 });
+        else items.push({ c: 'u', g, q: 0 });
+        continue;
+      }
+      const f = feature(g, top, bot);
+      const r = classify(f, g.w / Hd);
+      items.push({ c: r.c, g, f, fv: OPT.train ? variants(g, top, bot) : null, a: g.w / Hd, q: r.d / Math.max(r.d2, 1e-6), d: r.d });
+    }
+    let text = '', started = false, minQ = 0;
+    for (const it of items) {
+      if (/[0-9.+\-]/.test(it.c)) { text += it.c; started = true; minQ = Math.max(minQ, it.q); }
+      else if (started) break;
+    }
+    return { text, items, q: minQ };
+  }
+
+  const RULES = {
+    TQ: (s) => /^\d{1,3}$/.test(s) && +s <= 160,
+    ITT: (s) => /^\d{3}$/.test(s) && +s >= 300 && +s <= 1100,
+    NG: (s) => /^\d{2,3}\.\d$/.test(s) && +s >= 50 && +s <= 110,
+    IAS: (s) => /^\d{1,3}$/.test(s) && +s <= 200,
+    ALT: (s) => /^-?\d{1,5}$/.test(s) && +s >= -2000 && +s <= 20000,
+    OAT: (s) => /^[+-]?\d{1,2}$/.test(s) && Math.abs(+s) <= 60,
+  };
+
+  // ---------- main ----------
+  function analyse(img, opts = {}) {
+    const cv = toCanvas(img, opts.maxDim || 1800);
+    let cands = findTables(cv);
+    if (cands.length < 2) return { error: cands.length ? 'Only one PWR CHECK box was found. Keep both boxes in the photo.' : 'No PWR CHECK boxes were found.', cands };
+    // keep the two best, at similar height and size
+    cands.sort((a, b) => b.score - a.score);
+    let pair = null, bestS = -Infinity;
+    for (let i = 0; i < cands.length; i++) for (let j = i + 1; j < cands.length; j++) {
+      const A = cands[i], B = cands[j];
+      const sz = Math.min(A.area, B.area) / Math.max(A.area, B.area);
+      if (sz < 0.5) continue;
+      const s = A.score + B.score + sz;
+      if (s > bestS) { bestS = s; pair = [A, B]; }
+    }
+    if (!pair) return { error: 'Could not match the two PWR CHECK boxes.', cands };
+    pair.sort((a, b) => a.cx - b.cx);
+    const eng = pair.map((t) => {
+      const rb = rowBounds(t.hl);
+      const vals = {}, rows = {};
+      ROWS.forEach((k, i) => {
+        const x0 = Math.round(t.div + 5), x1 = RW - 3;
+        const y0 = Math.round(rb[i][0] + 4), y1 = Math.round(rb[i][1] - 3);
+        const gls = glyphs(t.px, x0, x1, y0, y1);
+        const r = readRow(gls);
+        if (k === 'NG' && /^\d{3}$/.test(r.text)) r.text = r.text.slice(0, 2) + '.' + r.text.slice(2);
+        if (k === 'OAT' && /^\d/.test(r.text) && r.items.some((it) => it.c === '-')) r.text = '-' + r.text;
+        r.ok = RULES[k](r.text);
+        r.box = [x0, y0, x1, y1];
+        rows[k] = r; vals[k] = r.text;
+      });
+      return { vals, rows, px: t.px, hl: t.hl, div: t.div };
+    });
+    return { eng };
+  }
+
+  // picture of one row's value cell (for the confirm screen)
+  function cropURL(e, k, scale = 2) {
+    const [x0, y0, x1, y1] = e.rows[k].box;
+    const pad = 3, X0 = Math.max(0, x0 - pad), Y0 = Math.max(0, y0 - pad), X1 = Math.min(RW, x1 + pad), Y1 = Math.min(RH, y1 + pad);
+    const c = document.createElement('canvas'); c.width = X1 - X0; c.height = Y1 - Y0;
+    const id = new ImageData(e.px.slice(), RW, RH);
+    c.getContext('2d').putImageData(id, -X0, -Y0);
+    const c2 = document.createElement('canvas'); c2.width = c.width * scale; c2.height = c.height * scale;
+    const x = c2.getContext('2d'); x.imageSmoothingEnabled = true; x.drawImage(c, 0, 0, c2.width, c2.height);
+    return c2.toDataURL('image/png');
+  }
+
+  return { OPT, analyse, cropURL, setTemplates, ROWS, RULES, _feature: feature, _RW: RW, _RH: RH };
+})();
+
+const SCAN_TPL = [{"c":"6","a":0.633,"f":"001367774200012578886310014799997410025899997410136899997410147999997410258999998520258999998631248999999742147999999852136999999742025899999631014799998520013678886310001345553100000122321000"},{"c":"6","a":0.633,"f":"002589996310014789997520126899998630147999998630248999998520258999998520358999999631358999999742358999999852258999999853258999999852147999999852136899999741024789998521012467875310001256663100"},{"c":"6","a":0.633,"f":"000123432000001356663100002588885200014799986300014899985200025899985200136999996310137999998520136899998631025899999631015899998631014799998520013689997410001467775200000134432100000011111000"},{"c":"1","a":0.333,"f":"000012320000000124531000000147862000000258973100000258963100000258852000000148852000000147852000000147863000000147974100000158974100000258974100000258974100000147974100000136763100000024642000"},{"c":"1","a":0.333,"f":"000025641000000146752000001368973100001479974100001479974100001479974100000368974100000258974100000258974100000258974100001369974100001479974100001479974100001368974100000258974100000147973100"},{"c":"1","a":0.333,"f":"000001110000000013321000000136641000000147852000000147851000000147741000000036741000000025641000000025741000000025752000000136852000000147852000000147852000000136752000000014531000000012321000"},{"c":"7","a":0.484,"f":"002468875200013688986310014899998410013689998410002478997410000258997310000147985200000258974100000268963100001479852000002589741000003698630000013797410000013785200000002453100000001221000000"},{"c":"7","a":0.484,"f":"013699997310014799997410014899998410014799998410013589998410001368997410000268997410001379986300001479985200002589973100013799862000014799741000014898631000014897410000013664200000002442100000"},{"c":"7","a":0.484,"f":"001245653100002467775200003699997310002579997310001257996300000036885200000026874100000137863000000147852000000258731000001378620000001477410000002576310000002464100000001232000000000110000000"},{"c":"2","a":0.516,"f":"000135642000001357763100013689986310014799997410025899998520025899998520013689998520001368997410000268986310002579863100014799741000025899752100025899875210025899997410014799986310014799974210"},{"c":"2","a":0.516,"f":"001258863100002478875210014799997410025899998520025899998520025899998520014789998520013589998520002589997410013689975200014799863100025899864200025899986310025899998520025899997410025899997310"},{"c":"2","a":0.516,"f":"000023321000000245642000001478874100003689986300014799997410013689997410002468997410000247986300000147874100001368752000002688620000014798631000014799753100014799985200013678774200002466643100"},{"c":"2","a":0.548,"f":"000233321000001356653200013689886310014899998410015899998410014788998410012468998410001258997410001368986300002589974100014799963100025899963100025899986310025899997410015899986310014799985200"},{"c":"2","a":0.548,"f":"001356543100012577765210014799997410025899998520025899998520025899998520014689998520012479998520002479997410013799986300015899985200025899986210025899997410025899998520025899997410025899997310"},{"c":"2","a":0.548,"f":"000012100000001234432100002477765200013799997310014799997410013578997410001246897310000026886300000247974100001479863100003689852000014799852000014899874200014899986300013678775200002566653100"},{"c":"9","a":0.6,"f":"002478863100013689974200136899997410247999999630248999999741248999999742247999999842147999999842036999999842025899999742025899999741025899999630026999998520025899986310013578763100001356642000"},{"c":"9","a":0.6,"f":"013699984200025799986310137999998631247999999742248999999842248999999842248999999842248999999842247999999842137999999842037999999842137999999742147999999631137999997420024799975200013689963100"},{"c":"9","a":0.6,"f":"001235531000002467753100014789986310026999997410036999998620036999999630026999999630025899999630014899999630013799999630003799998620013799998410014799996310013688874200002355542000000123221000"},{"c":"1","a":0.367,"f":"000135420000001257631000001479741000002589852000002589852000001589852000001479852000001479852000001479852000001479852000001479852000001479862000001589974100001589974100001378873100000258852000"},{"c":"1","a":0.367,"f":"000258741000001378852000002589863100002589974100002589974100002589974100002589974100002589974100002589974100002589974100002589974100002589974100002589985100002589985200001479974100001479974100"},{"c":"1","a":0.367,"f":"000012110000000134310000001367631000001479741000001479741000001369741000000258741000000258741000000258741000000258741000000258741000000258741000001369852000001369863100000257752000000136631000"},{"c":"3","a":0.533,"f":"003699862000014799974100025899986200025899997410013689997410001479998410000369998410000269998410000258998520000136898620012236899630024657899630036888998520036999987410025899864200014789752100"},{"c":"3","a":0.533,"f":"014899984100025899986200036999997410026999998520014799999630002689999630002589999630001479999630001379999630001258999630013457999630025778999630036999999630036999998520026999986310026999974200"},{"c":"3","a":0.533,"f":"001466531000002578752000013799974100013699985200002479996300000268996300000258996300000147996300000137997300000025897410001114797410013435897410025777997410026889875200013677652100012356421000"},{"c":"1","a":0.281,"f":"000135420000000257631000001479852000001479852000001479852000001479852000001479852000001479852000001379852000000268852000000268862000001379973100001479974100001479974100000357752000000246642000"},{"c":"1","a":0.281,"f":"000257741000001368852000001479973100001479974100001479974100001479974100001479974100001479974100001479974100001479974100001479974100001479974100001479974100001479974100001479963100001379862000"},{"c":"1","a":0.281,"f":"000022210000000135420000000257631000000258741000000258741000000258741000000258741000000258741000000258741000000147741000000147741000000258852000000258852000000258852000000136631000000123321000"},{"c":"2","a":0.562,"f":"000136763100001357874200002689997410014799998631014799999741013689999731002368998620000247997410000258986310002479985200013799984100014899986210026899997520036899998630024788887420013578875310"},{"c":"2","a":0.562,"f":"001258974200002478986310014799998621025899999741025899999741014799999741013579999741001368998631001368997420013689996310025899996310136999997420147999999631147999999741136899998631125899998521"},{"c":"2","a":0.562,"f":"000023542000000246763100001478986310002589997410002589998520001478998520001247897410000025886300000136874200001368863100002589963000003699974100014799986310014799997410013567765310001345543100"},{"c":"1","a":0.344,"f":"000023321000000135642000000368873100001479985200001479985200001479984100000369974100000258974100000258974100000258984100000258985200000369985200001479985200001589985200001367874100001246763100"},{"c":"1","a":0.344,"f":"000135642000001257763100001479974100002589985200002589985200002589985200001489985200001479985200001479985200001479985200001479985200001489985200002589985200002589985200001479985200001379985200"},{"c":"1","a":0.344,"f":"000001110000000023421000000146752000000258973100000258974100000258963000000148852000000147852000000147852000000147963000000147974100000148974100000268974100000368974100000246653100000124432000"},{"c":"1","a":0.367,"f":"000135420000001257631000001479741000002589852000002589852000001589852000001479852000001369852000001369852000001479852000001479863000001479974100001589974100001589974100001368863100000257752000"},{"c":"1","a":0.367,"f":"000258741000001378852000002589863100002589974100002589974100002589974100002589974100002589974100002589974100002589974100002589984100002589985200002589985200002589985200001479974100001479974100"},{"c":"1","a":0.367,"f":"000012110000000134310000000257631000001479741000001479741000001369741000000258741000000258741000000258741000000258741000000258841000000258852000001369852000001368852000000246631000000124421000"},{"c":"0","a":0.633,"f":"001479974100012589985210014799997410136899998631247999999742258998899852358986689853358964579853358864479853358975589853258987789852247999999742136899998521024789986310012467763100001246642000"},{"c":"0","a":0.633,"f":"002589985200014789987410136899998631247999999742258999999852358999999853358988899853358987789853358986789853358987789853358998899853258999999852247999998731136899997520013689985210002479974100"},{"c":"0","a":0.633,"f":"000246642000001367763100013689986310014799997410136899998631147987789741147864468741147852258741147841258741147853368741147875689741136888898621025899987410013578874200001245542100000122221000"},{"c":"0","a":0.6,"f":"000136642000001357764100012589986310014799997410025899998631136988899741147987789741147975689741147976689741147987789741147988899741136899998631014799997410012589985210001357753100000136631000"},{"c":"0","a":0.6,"f":"000258974100001478985210013689997410126899998631147999999741147999999741147988899741147988899741147988899741147998899741147999999741147999999741136899998621014689986310001478874100000258852000"},{"c":"0","a":0.6,"f":"000012221000000135542100001368874100002689986310014789997410015787788520025864578520025753368520025753368520025875578520025887788520014799997410013689986310001468863100000135531000000012210000"},{"c":"0","a":0.633,"f":"000258742000001478863100013689986310126899998621147999999741247987789852258976689852258974579853358975579852258986689852258988899741147999998631136899997410014799985210012578753100001366631000"},{"c":"0","a":0.633,"f":"001479974100013589985310125899998521247999999742258999999852358999999853358988889853358987789853358987789853358988899853358999999852258999999742247999998631136899986310014789874100002589852000"},{"c":"0","a":0.633,"f":"000135421000001357642100012589875210014799997410025888898520025876688631136863368741147852258741147852258741147863468631136876688520025888897410014799986310013588863100001355531000000123210000"},{"c":"+","a":0.5,"f":"000000000000000000000000000000000000000001110000000124531000001357763100013689986310014799997410014799998510002589997410001257886200000124653100000001221000000000000000000000000000000000000000"},{"c":"+","a":0.5,"f":"000000000000000000000000000000000000000012320000001246642000012578874200014799997410025899998520025899998520013799998520002478997410000236774200000013432000000001110000000000000000000000000000"},{"c":"+","a":0.5,"f":"000000000000000000000000000000000000000000000000000012320000000236642000002478874100003689986300002589996300001368986200000136764100000013432000000001110000000000000000000000000000000000000000"},{"c":"2","a":0.562,"f":"000246642100002467764200014789997410136899998520137999998520136899998620013689998520001479997410001369985200002479863100014799852000136899863100147999986310147999997410136899986310125899985200"},{"c":"2","a":0.562,"f":"001368974200013679986310126899998621147999999741147999999741147999999741125799999731013689998520002589997310013689974200025899963100137999975210147999987420147999998620147999998520137999997410"},{"c":"2","a":0.562,"f":"000124421000001246653100012579985200014799997410025899997410014799997410002479997310000258985200000258973100001368742000002588631000014799741000025899863100025899985200014678774200013566653100"},{"c":"3","a":0.531,"f":"001256531000012477753100014799986200025899997410014689998410012479997410001379997410001479997410001479998410001368998520001358998520012578998520024789997410025899986210014788753100013787531000"},{"c":"3","a":0.531,"f":"002479852100013689874200025899997310025899998520025899998520013689998520002689998520002689998520002689998520001479998520012479998520014689998520025899998520025899997410025899874200014899852100"},{"c":"3","a":0.531,"f":"000133320000001356542000013689874100013689986300012478997310001258996300000258996300000368996300000268997310000147997410000137998410001357997410013689997310014899874200013677642000002465320000"},{"c":"6","a":0.633,"f":"000135642000001356764100014688986310136899998510147999997410248999996310248999996310247999997410147999998631147999999741147999999742147999999741126899998631013689997410001468985210000258974100"},{"c":"6","a":0.633,"f":"001258974100012578985310125789998521247999999631258999998631358999998520358999998520358999998631358999999742358999999852358999999853258999999852247999999742125899998631013589987410001479985200"},{"c":"6","a":0.633,"f":"000012221000001234542100012467875200014789996310025899986310136899985200136899985200025899986310025899997410025899998520025899998630025899998620014799997410012578986310001256763100000125642000"},{"c":"2","a":0.4,"f":"000368742000001479863100001479974100001479986200001379996300000258996200000147985200000037985200000147974100000148973100000258973000001379974100001489985200002589996200002589985200001489984100"},{"c":"2","a":0.4,"f":"001489963100002589974100003699996200002699996300002589996300001379996300000258996300000258996300000258996200000369985200001479985200002589985200002699996200003699996300002699996200002699996200"},{"c":"2","a":0.4,"f":"000145421000000257641000000369863000000269974100000258974100000137974100000025873100000025863000000025862000000036852000000147852000000258852000000369973100001479974100001368863100000256652000"},{"c":"7","a":0.586,"f":"013689875310125789887420136899998631125788999731012457898631000135898520000025896310000026885200000147874100000258863000001368852000001479741000002588631000002588520000001466310000001354200000"},{"c":"7","a":0.586,"f":"025899998520136899998631147999999741136899999741013578999741001257998631000147998520000147997410000258985200001369984100001479974100003689863000014799852000014798631000003688520000002587410000"},{"c":"7","a":0.586,"f":"001356532100013577764210014789987410013578998520001246897410000014786310000013785200000014774100000025752000000136741000000147741000000368630000001477520000001366310000000243100000000111100000"},{"c":"0","a":0.655,"f":"000124432100001256654210013578887420125899998631147999999742258987789852258985579853358974368853258974358853248974368852147986579852136988889741025899998631014799998520012589986310001479985200"},{"c":"0","a":0.655,"f":"000257864200001468876310014689998631136899999742258999999852358998899853358987789853358986679853358986679853358987689853258998889853258999999852147999999742126899998631014789998520002589997410"},{"c":"0","a":0.655,"f":"000012211000000134442100001467875310013689998520025888898631136876689741147863368741147852147741147852147741136852247741025874368631015886688520014788897410002589986310001367874200000246653100"},{"c":"9","a":0.655,"f":"001245521000012467652100024789875310136899998631147999999741247999999742248999999852147999999852125899999853013699999852013699999842014799999741015899998631014799987410012589875210001479863100"},{"c":"9","a":0.655,"f":"002478852000013689864210136899987421247999998742258999999852358999999853358999999853247999999853136899999853025899999853025899999853136899999852136999999742126899998631014789986310002589985200"},{"c":"9","a":0.655,"f":"000122210000001245431000013578764200014799986310025899998520025899998520136899999631125899999741013689999741002589999741002589998631003689998520013699997410002589985210001367753100000246641000"},{"c":"9","a":0.655,"f":"000246642000001467764200014689987410136899998631147999999741147999999852147999999852136999999853025899999853013699999853003689999852013699999742014799998631013689986410002478763100001356642000"},{"c":"9","a":0.655,"f":"001479974100013589986310125899998631247999999742258999999852358999999853358999999853247999999853136899999853025899999853014899999853015899999852025899999742014799998521013689985310002589974100"},{"c":"9","a":0.655,"f":"000122221000001245542100012578875210014799997410025899998520025899999631025899999741014799999741013689999741002589999741001489999741001589998631002589997420001478875210001245542100000123221000"},{"c":"0","a":0.69,"f":"001356642100002478764200014799986310026899998520137999999731247987789742358974579842369963379852469973379853469975579863358987789852247999999731026899997420014799986200002578864100001467752000"},{"c":"0","a":0.69,"f":"002489974200013689986310025899998520147999999731358999999852369999999963469987789964469986689964469986689964469988889964469999999963358999999852247999998631026899997410014799986200003699984100"},{"c":"0","a":0.69,"f":"000123221000001345542100002578875200014799997310025888898520036875679620137852368630247841258730248852258741247863368741147975579731026887888520014799986310002588874100001356542000000133321000"},{"c":"7","a":0.552,"f":"014799997410014799998520014799998620012579998520001258997410000037996300000036986200000037985200000147974100001368963100002589742000002698630000003697410000002686310000001464100000001342000000"},{"c":"7","a":0.552,"f":"026999999620026999999620026999999630014789999630002478998620000258998520000148997410000258997300000369996200002589985200013699863100014799741000014899630000014797410000013676200000002474100000"},{"c":"7","a":0.552,"f":"002466664200002578875310002689997410001368997310000136886200000025885200000014874100000025873000000036862000000257852000001368631000001477410000001476300000001464100000001232000000000111000000"},{"c":"1","a":0.355,"f":"000247520000000267631000001479852000001479863000001479974100001479974100001479863000001369852000000258852000000258852000000258963100001369974100001479974100001479873100001368852000000258741000"},{"c":"1","a":0.355,"f":"001379741000001479852000002589863100002589974100002589985200002589985200002589984100001589974100001479974100001479974100001479985100001589985200002589985200002589974100001479863100001479852000"},{"c":"1","a":0.355,"f":"000023310000000135420000000257631000000258741000000258852000000258852000000258841000000158741000000147741000000147741000000147852000000258863000000368863100000368852000000247631000000135420000"},{"c":"2","a":0.548,"f":"000258985200001478986310013689998520015899998631014789999741012467999741001247998631000257997410001368986310012589874100014799852100025899863100136899986310136899997420025798876310013688764200"},{"c":"2","a":0.548,"f":"001479997410013589998520125899998631136999999741136899999741024789999741012579999741001479998631002589997420014789985210126899974100147999975210147999987521147999998631136899998521025899997410"},{"c":"2","a":0.548,"f":"000136642100001357764100002589986310013699997410013578998520001346898520000135897410000136886310000258974200001478852100002689741000014799742100014899874210014799876310013577654210002455322100"},{"c":"1","a":0.355,"f":"000257631000001368741000001479852000002589963100001589974100001479974100001369974100000258963100000258963100000258974100000268974100001479985100001479985200001479974100001257752100000136631000"},{"c":"1","a":0.355,"f":"001479852000001479863000002589974100002589985100002589985200002589985200001589985200001479984100001479984100001479985200001479985200001589985200002589985200002589985200001378873100000258852000"},{"c":"1","a":0.355,"f":"000124310000000146520000000368741000001379851000001369852000000258852000000158852000000147841000000147841000000147852000000147852000000258963100001368974100000258863100000135531000000012210000"},{"c":"1","a":0.333,"f":"000135531000000147741000000368852000001479852000001479852000001369852000000258852000000148852000000147852000000147852000000258863000000368974100001479974100001479863100001368752000000247631000"},{"c":"1","a":0.333,"f":"000258852000000368863000001479974100001479974100001479974100001479974100001479974100000368974100000258974100000258974100000368974100001479974100001479974100001479974100001479863100001379852000"},{"c":"1","a":0.333,"f":"000012210000000124420000000147631000000258741000000258741000000158741000000147741000000036741000000025641000000025641000000136741000000147852000000258852000000257741000000135531000000123320000"},{"c":"0","a":0.633,"f":"001356642000002478763100014789986310136899998621247998899741258987789842358975589852358853479853358853479853358865689852258987789842247999999741136899998521014689876310001467653100000246521000"},{"c":"0","a":0.633,"f":"002589974100013689985310125899998521247999999742258999999852358998899853358987789853358976689853358976689853358987899853358999999853258999999852247999999742125899987521013589874210001479852100"},{"c":"0","a":0.633,"f":"000122221000001245542100012578875210014799997410136887888520147875578631147852368741147741258741147741258741147853478741147875688631136888898520024799987410012578764210001245432100000122210000"},{"c":"0","a":0.6,"f":"001367641000001478753100003689985210014799997410025898898631136887789741147976689741147975589741147975589741147976689741147987899741147999998631126899997410013688875210001366542100000234311000"},{"c":"0","a":0.6,"f":"002589852000013689874100014799986410025899998631136999999741147998899741147988899741147987789741147987899741147988899741147998999741147999999741137999998621125899986310013578753100001467531000"},{"c":"0","a":0.6,"f":"000124320000001246631000001478864100002589986310013677897410014765688520025753378520025752368520025752368520025763478520025875688520025888887410014799885310012577653100001244321000000112100000"},{"c":"0","a":0.633,"f":"000257641000001468753100013689985210025899997410136899998631147987789741258864579741258853369742358853369852358974579852258987789852247999999741125899998521013689985310001467753100000246631000"},{"c":"0","a":0.633,"f":"001479852000012589874100024799986410136899998631247999999742258998899852358987789853358976689853358976689853358987789853358998899853258999999852137899998631025799986410012589874100001479852000"},{"c":"0","a":0.633,"f":"000123320000001246531000002478864100013689986310014788897410025875688520136753367520147741257520147741147631147852358741147875578631126888888520014789986310002478864100001245531000000122210000"},{"c":"+","a":0.516,"f":"000000000000000000000000000000000000000012221000000135642100002468875210013689997410015899998510014799997410012578875210001246642100000123321000000000000000000000000000000000000000000000000000"},{"c":"+","a":0.516,"f":"000000000000000000000000000011110000000124431000001357763100013589986310014799998520025899998520025899998520013689986310001367764100000134431000000011110000000000000000000000000000000000000000"},{"c":"+","a":0.516,"f":"000000000000000000000000000000000000000011110000000124431000001357763100002589985200013689986310002589985200001367753100000134431000000011110000000000000000000000000000000000000000000000000000"},{"c":"2","a":0.548,"f":"000258985200001468986310013689998520025899998631025899999741013678999741001357999631000147998520001368986310012589974100014799863100025899974100036899986410025899998520013688876420002578765210"},{"c":"2","a":0.548,"f":"001479997410013589998520125899998631137999999741137999999741125789999741012578999741001368999731001478998521014689986310136899985200147999986310147999998521137999999631125899998631014799998520"},{"c":"2","a":0.548,"f":"000125653100001256774200002578986310013799997410013689998520002467898520001135898510000025897410000147885200001468863100013689852000014799863100014799985210014788886310012466654210001244322100"},{"c":"3","a":0.581,"f":"002589852000013689863100014799986200013689997410002468997410001247997410000147997410000147997410000136898520000025898520011236898520124568998520136889986310135889864100013567631000001355420000"},{"c":"3","a":0.581,"f":"014799974100014799985210025899997410025899998520013689998520001368998520000268998520000368998520000258999631001247999741013457999741135788998631147999997420136899985210124789853100012588741000"},{"c":"3","a":0.581,"f":"001246521000001467642100002589874100001478985200001247885200000125885200000025885200000036885200000025896310000014797410001124797410012456886310014688874200013678752100001345421000000122210000"},{"c":"5","a":0.656,"f":"014677764200135788875310247999997410258999997410358999997310358999997410258999998631247999999741136899999741025899999742025899999742136899999742147999999741147999998621126899986310024799874200"},{"c":"5","a":0.656,"f":"136899986310247999987420258999998620358999998620358999998520358999998631358999999742258999999852247999999853137999999853137999999853247999999853258999999852258999999742247999998521136999986310"},{"c":"5","a":0.656,"f":"002456542100014677763100136899986200147999986300147999985200147999986310147999997410136899998520025899998520013799998520013799998630014899998630025899998520025899997410014788875210013577753100"},{"c":"7","a":0.656,"f":"135899999631147899999742147999999852136899999852024789999741012579998631000268998520000258997410000368986310001479985200002589974100002589863100002589852000002588631000001477420000001365310000"},{"c":"7","a":0.656,"f":"247999999742258999999852258999999853247999999853136899999852013689999842001479999741001479998631001479997410002589996310013699985200014799974100014799863100014799852000013688631000002587520000"},{"c":"7","a":0.656,"f":"013677777420024788888521025899999731024799999631013589998520001368998410000147997410000147986300000158985200000368974100001479863000001489852000001488631000001477520000001355310000000233100000"},{"c":"6","a":0.636,"f":"000135531000001357753100013589985210125899997420247999998620258999998520358999998520358999998521358999999731358999999741258999999741248999998631147999998520126899986310013688874200002467763100"},{"c":"6","a":0.636,"f":"000257752000012468864100124789987410247899998631258999999741358999999731358999998631358999999741358999999852358999999853358999999852358999999742258999998631247999998520125799986310013689985200"},{"c":"6","a":0.636,"f":"000012211000000135532000001468864100013689986310126899997410147999997310147999986310147999997410147999998520147999998520147999998520136899997410025899986310014799985200012467753100001245542000"},{"c":"8","a":0.636,"f":"000135652100001357774210013689997410025899998631136899999741147999999741147999998631147999998631147999999731147999999742147999999852147999999852147999999742125899998631013689886310002478864200"},{"c":"8","a":0.636,"f":"001257874200012578886310125799998631147999999742248999999852258999999852358999999842358999999842358999999852358999999853358999999853358999999853258999999852136899999742024799997521013699986310"},{"c":"8","a":0.636,"f":"000013431000001235653100002478885210013799997410014899998520025899998520025899998410025899998410025899998520025899998520025899999631025899999731025899998631014789997410002478764210001357642100"},{"c":"5","a":0.606,"f":"013689985200014789986310136899997410147999997410147999996310147999996310147999998520137999999631026899999741025888999741025888999741136999999631147999998520136999986310025788864100013677752000"},{"c":"5","a":0.606,"f":"014799997410125899997410137999998520147999998520147999998410147999998520147999998631147999999741136999999741136999999741136999999741147999999741147999998631147999997420136899985210025899973100"},{"c":"5","a":0.606,"f":"002467763100013678875200015899996300025899986300025899985200025899985200025899986310025899998520014788998520014788898520014788898520025888998520025899997410025899985200013677752100002456531000"},{"c":"9","a":0.656,"f":"002589864100013689875210025899997410147999998520258999999731358999999842358999999852258999999853247999999853147999999852147999999842147999999741136999998520025899986310013688863100002577742000"},{"c":"9","a":0.656,"f":"013799986200024799997410136899998520258999999731358999999852358999999853358999999853358999999853358999999853358999999853358999999853258999999852248999999741137999998520025899975210013799863100"},{"c":"9","a":0.656,"f":"001356542100002577764200014799996310026899998410137999998520147999999631147999999741137999999741036999999741025899999741025899999631025899998520025899997410014799974200012567642000001345421000"},{"c":"0","a":0.625,"f":"002466652100013678774200025899997420025899999631136999999741247999999741258999999742358998899842358998899852358999999853258999999852248999999742147999998631126899997410013689874200002479852100"},{"c":"0","a":0.625,"f":"013799974200025899986310137999998631247999999742248999999853258999999853358999999853358999999853358999999853358999999853358999999853358999999852258999999742247999998631124799986310013689974200"},{"c":"0","a":0.625,"f":"001234431000002466653100013699986310014799997410014899998520026899998520137998898520147987789631147987789741147998899741147999999741136999998631025899997420014799986310002477753100001256531000"},{"c":"4","a":0.906,"f":"000000135421000001257631000002579742000013799852000025899864000147999976000258999987001369999988012579999999235789999999568899999999899999999999999987789987999854478976888631146753787420024532"},{"c":"4","a":0.906,"f":"000001257742000001478752000013689853000025899964000147999976000258999987001379999999002589999999124789999999457899999999789999999999999999999999999988899999999876689988999742368875898631147853"},{"c":"4","a":0.906,"f":"000000012210000000135410000001367620000002589631000014799742000025899863000137999975000258999976001368999987123589999988356899999987789988899987899865679976888642357864676410024532455210012321"},{"c":"1","a":0.406,"f":"000247852000001368863000002589974100003699974100003699974100002689974100002589974100001489974100001479974100001479974100001479985200002589985200002689985200003689996300002589986300001479985200"},{"c":"1","a":0.406,"f":"001379963100002589974100003699985200014799985200014799985200014799985200013799985200003699985200002589985200002589986200002689996300003699997410014799997410014799997410013799997310003699996300"},{"c":"1","a":0.406,"f":"000124421000000246641000001379852000002589852000002589852000001479852000001479852000000369852000000258852000000258862000000268973100001379974100001479974100001479984100001367764100000246653100"},{"c":"1","a":0.406,"f":"001368852000001479852000003689852000013799963000014799974100003699974100002689974100002589974100002589974100002589974100002589984100002689986200003699997310014799997410003699986300002589975200"},{"c":"1","a":0.406,"f":"001479973100002589974100013799974100014799984100014799985200014799985200014799985200014799985200014799985200014799985200014799986200014799996300014799997410014799997410013799997310003699996300"},{"c":"1","a":0.406,"f":"000246531000001357631000001479741000002589841000002589852000002589852000001479852000001479852000001479852000001479852000001479863000001479974100002589985200002589985200001478764100001366642100"},{"c":"9","a":0.625,"f":"001368863100013679975210136899998520258999999731358999999741358999999742358999999842358999999852258999999853247999999852137999999742147999998631247999997420137999986310024788864100012477642100"},{"c":"9","a":0.625,"f":"012589975210124789987420247999999731358999999852358999999853358999999853358999999853358999999853358999999853258999999853258999999852258999999742358999998631247999997420136899986310024799974200"},{"c":"9","a":0.625,"f":"000246642000002467763100024789986310136999998520147999998520147999998520147999999631147999999741137999999741026899999731025899998620025899997410026899986310025799974200012567642100001345421000"},{"c":"1","a":0.406,"f":"000245420000001367531000002589741000002589852000002589852000002589963000002589973100001489973100001479963000001479862000001479863000002589974100002589985100002589985100002589874100002478863100"},{"c":"1","a":0.406,"f":"001367631000001478742000002589863000002589973100002589974100002589974100002589984100002589984100002589974100002589974100002589974100002589985200002589985200002589985200002589985200002589985200"},{"c":"1","a":0.406,"f":"000122110000000245310000001468631000001489741000001489741000001479851000001479852000001479852000000369851000000268741000000368852000001479863000001479974100001489974100001478863100001357642000"},{"c":"5","a":0.625,"f":"025799987410136899997420247999998520258999997410358999996310258999997410258999998521147999999742136999999852025899999853025899999853136999999852147999999742137999998521125788875310013677763100"},{"c":"5","a":0.625,"f":"136999999631247999999731258999999741358999998631358999998520358999998520358999998731258999999852258999999853247999999853247999999853258999999853258999999852258999998631136899986410125899985200"},{"c":"5","a":0.625,"f":"013577775210014788886310136899997410147999986300147999985200147999985200136999987410025899998631015899999741014799999741014799999741015899999741025899998621025899986310013677764100002456542000"},{"c":"0","a":0.656,"f":"001367774200002478885210014789997420136899998631247999999742258999999852358999999853358987789853358987789853258987789852258999999742147999998631136899998520025799986310013578874100001467753100"},{"c":"0","a":0.656,"f":"001479986200013689997410125899998631247999999742258999999852358999999853358999999853358999999853358999999853358999999853358999999852258999999742247999998631136899997420014789985210002589974100"},{"c":"0","a":0.656,"f":"000245653100001367764100012689986310024799997410136899998631147999999741147988889741147975579741147974479741147976679741136888888631025899998520014899996310013689985200002467753100001356531000"},{"c":"0","a":0.656,"f":"001467763100012578875210014799997420025899998631136999999742147999999742248999999842258998899852358998899852258999999852258999999852147999999741136899998631014799997410012578875200001467763100"},{"c":"0","a":0.656,"f":"002589985200014789987410126899998631147999999742258999999852258999999853358999999853358999999853358999999853358999999853358999999853258999999852247999999742136899998521014789986310002589975200"},{"c":"0","a":0.656,"f":"001245542000001467764100003689986310014799998520015899998620025899998630136888888631147986689631147986689741147988889741136999999631025899998520014799997410013689986310001467753100001245531000"},{"c":"+","a":0.515,"f":"000000000000000000000000000012210000000135531000001367763100002589986310014799998520014899998520014799998520013689997410002479986310001257863100000124531000000011110000000000000000000000000000"},{"c":"+","a":0.515,"f":"000000000000000011100000000123320000000246642100002478875210013689997410025899998520025899998520025899998520014799998520013689987410001368975200000146652100000013321000000001100000000000000000"},{"c":"+","a":0.515,"f":"000000000000000000000000000001100000000013320000000146642100001368875200002589997310003699997410003699997410002589986310001368974200000146652100000013321000000001100000000000000000000000000000"},{"c":"2","a":0.576,"f":"001369985200002479986310014789998521126899999731136999999741136899999741014799998631013699997520002689986310013699985200014799985310136899987521147999999731147999999741137999998521136999997420"},{"c":"2","a":0.576,"f":"001479997310013689997520125899998631137999999741147999999741147999999741136899999741025899998631014799997410025899986310136899997410147999998631147999999741147999999741147999999731137999999631"},{"c":"2","a":0.576,"f":"000247763100001368875200012689997410014799998520015899998520014799998520013699998410002589986310001589985200002589863100013699863100014799875310025899997420025899998520024788887410014677775310"},{"c":"0","a":0.667,"f":"002478863100013688875310126899998531147999999742258999999852358999999853369999999963469999999964469999999964369999999863358999999853258999999852247999999742136899998521014688875310002478763100"},{"c":"0","a":0.667,"f":"013689975210125789987421247999998742358999999863369999999964469999999964469999999964469999999964469999999964469999999964469999999964469999999964368999999853247999998632125789986410013689975200"},{"c":"0","a":0.667,"f":"001246642000012467763100014789986410025899998631136999999741147999999742258999999852258999999852258999999852258999999842247999999741147999999741136899998631024789986410012467763100001246532000"},{"c":"5","a":0.656,"f":"124677764100136888875200258999997310358999997410358999986300258999985200248999985200147999997410136899998621025899999741136899999842147999999852147999999742147999998631125799987410013689985200"},{"c":"5","a":0.656,"f":"136899985200247999986310258999998520358999998520358999997410358999996310358999997310258999998521247999999742247999999852247999999853258999999853358999999852258999999742136899998521125899997410"},{"c":"5","a":0.656,"f":"012456542100124677763100137999985200147999985200147999985200147999974100136899984100025899986210014899997410014799998520014799998631025899999731025899998631025899997520013688875210002467764100"},{"c":"7","a":0.625,"f":"136899876420247899887631247999999742136899999852013689999853001368999852000148999852000258999741001368998631002589997410003689986310014799985200014799863100014799852000013588631000002477520000"},{"c":"7","a":0.625,"f":"247999998631258999998742258999999852247999999853125789999853012579999853001368999853001369999852002589999742013689998631014799997410025899986310026899985200025899863100014799852000013699741000"},{"c":"7","a":0.625,"f":"024677654210125788876410136899998631024789999741012468999741001146899741000026899631000136998520000258997410001368986310001479974100002589863100002689852000002588631000001466420000001355310000"},{"c":"6","a":0.656,"f":"013589752100024789874200147999997410258999998510358999998520358999998510358999998520358999998620358999999731258999999742248999999852147999999842136999999741025799999631012577877420001346665310"},{"c":"6","a":0.656,"f":"024799974100136899986310258999998520358999998630358999999631358999998620358999999631358999999741358999999852358999999853358999999853258999999853247999999852136899999742014689998631002479997420"},{"c":"6","a":0.656,"f":"001356531000013577753100025899986210137999997410147999997410147999997410147999997410147999998410147999998520147999999630136999999631026899999631025899998620013689998510001356665310000123443100"},{"c":"9","a":0.688,"f":"014799852100125899874100247999986310368999998520579999999731579999999842358999999852247999999853137999999863147999999975147999999975147999999863136899999742014789998521002367765210000135543100"},{"c":"9","a":0.688,"f":"126899974200247999986310468999997420579999998631679999999852679999999964579999999975368999999976258999999976258999999976358999999976258999999975247999999863136899998632013578886410001357875210"},{"c":"9","a":0.688,"f":"002466531000014677752100136899974200247999986310258999998520258999999631147999999741026899999741025899999742025899999852025899999852025899999742014799998621012578886310001245543100000023321000"},{"c":"1","a":0.438,"f":"000268631000001378752000002589973100002589985200002589985200001479985200001479985200001379985200001369985200001379985200001479986200002589997310013799997410013699997410002478986300001257874200"},{"c":"1","a":0.438,"f":"001479852000002589863100013799985200014799997310013799997410002689997410002589997410002589997410002489997410002589997410002689997410013799997410014799997410014799997410002689997410002479997310"},{"c":"1","a":0.438,"f":"000135420000000257631000001379852000001479973100001379974100000268974100000258974100000258974100000248974100000258974100000268974100001479985200002589985200001479985200001357764100000135652100"},{"c":"9","a":0.625,"f":"014799742000125899863100247999986310258999998520358999999741358999999852258999999853247999999853136999999853137999999853247999999853258999999853137999999742024799998631002467876310001246664200"},{"c":"9","a":0.625,"f":"126899863100137999974200258999997420358999999731358999999852358999999853358999999853258999999853258999999853258999999853258999999853358999999853247999999852136899999742013689998521002479997310"},{"c":"9","a":0.625,"f":"002466421000014677642000136899974200147999997310147999998520147999999741137999999852026899999853025899999853025899999853136999999852137999999842025899999731013689997420001356664200000123432100"},{"c":"0","a":0.75,"f":"002589863100013689974200014799997410025899998631247999999742468999999864679999999975789999999986789999999987789999999987678999999987347899999987124799999975002589999853001367887521000246775310"},{"c":"0","a":0.75,"f":"014799974200014799986310026899998521147999999742368999999864679999999976789999999987789999999987789999999987789999999987789999999987568999999987336899999987013799999975002479998742001368997521"},{"c":"0","a":0.75,"f":"001356642000001467763100002689985200014799997410126899998631357999999742579999999853789999999964789999999975789999999976467999999976235799999975002689999853001379998631000246665310000123443100"},{"c":"1","a":0.438,"f":"001256420000002477631000013699852000014799973100003699974100002589974100001479974100001479974100001479984100001479985200002489986200003689997310014799997410013799997410002578996310001358986200"},{"c":"1","a":0.438,"f":"002478731000002689852000014799974100014799985200014799985200013799985200002689985200002589986300002589996300002589996310002689997410013799997410014799997410014799997410013689997410002479997310"},{"c":"1","a":0.438,"f":"000133210000001356420000001478731000002589852000001489852000001379852000000268852000000258863000000258963000000258963100000368974100001479985200002589985200001479985200001357774100000135663100"},{"c":"1","a":0.438,"f":"001356310000001467521000002589742000002589863100002589974100002589974100001589974100001479984100001479985200001479985200002589985200002689985200003689986300002589997410001479997410001369997310"},{"c":"1","a":0.438,"f":"002477520000002588641000014799863100014799974100014799985200014799985200013699985200002589986300002589997410002589997410003689997410014799997410014799997410014799997410013689997410002589997410"},{"c":"1","a":0.438,"f":"000133200000000245410000001378631000001479741000001479852000001479852000001369852000000258863000000258974100000258974100001368974100001479974100001479984100001479985200001368875200000247774100"},{"c":"1","a":0.438,"f":"000245420000001367641000002689863100013699974100003689985200002589985200001479985200000368985200000258985200000258985200001369985200001479996310002589997410002589997410001478997310001368996310"},{"c":"1","a":0.438,"f":"001367631000002578752100013799974100014799986300014799997410003689997410002589997410001489997410001479997410001479997410002589997410003689997410014799997410014799997410013689997410002589997310"},{"c":"1","a":0.438,"f":"000123210000001245421000001478741000001589863000001479974100001368974100000258974100000148974100000147974100000147974100000258974100000368985100001479985200001479985200001357874200000246764100"},{"c":"9","a":0.656,"f":"024677642000136888763100247999986310258999997410358999998631358999999741258999999741248999999842147999999852147999999853147999999852147999999852136899999741025799998521012578875310001467764100"},{"c":"9","a":0.656,"f":"136899863100247999874200258999987410358999998631358999999742358999999852358999999853358999999853358999999853358999999853358999999853258999999853247999999852136899998631014789987410002589985200"},{"c":"9","a":0.656,"f":"012465421000014677642100136899874200147999986310147999997410147999998520147999998520136899998631025899999741025899999741025899999741025899999631014899998520013689986310001467764200001245542100"},{"c":"1","a":0.364,"f":"001355310000001467521000002589741000002589852000002589963100002589974100002589974100001589974100001479974100001479985100001489985200002589985200002589985200002589985200001478985200001368985200"},{"c":"1","a":0.364,"f":"001467520000002478631000002589862000002589974100002589985100002589985200002589985200002589985200002589985200002589985200002589985200002589985200002589985200002589985200002589985200001479985200"},{"c":"1","a":0.364,"f":"000122100000000244310000001367520000001479741000001479851000001479852000001479852000001369852000000258852000000258963100000368974100001479974100001479974100001479974100000257864100000146763100"},{"c":"5","a":0.636,"f":"024799974200126899986310147999997410247999997410247999997310247999996300147999997310136899998520025899998631014799999741025899999852136899999852136999999852125899998731013689997520002589986310"},{"c":"5","a":0.636,"f":"136999996310247999997420258999998631358999998631358999998520358999998410258999998520247999998631136899999742026899999852136999999853247999999853258999999852137899999742025799998631013699998520"},{"c":"5","a":0.636,"f":"013577753100014788874200025899986300025899996300036899985200036899985200025899985200014799997310013699998410003699998520013799999631014899999741015899999731013799998521002578886310001367764200"},{"c":"0","a":0.667,"f":"001467642000013578763100025899986310137899998521258999999742358999999852369999999853469999999963369999999964358999999964258999999964247999999964136899999863024799999742012578998521001368997410"},{"c":"0","a":0.667,"f":"013689863100024789875210136899997420258999998731369999999853469999999964469999999964469999999964469999999964469999999964469999999964368999999964247999999964136899999853013689998742002579998631"},{"c":"0","a":0.667,"f":"000245421000001467642100013689874200125899987410137999998621247999999741258999999742258999999852258999999852247999999853147999999853136899999852025799999742013689998631001367886310000246775200"},{"c":"0","a":0.667,"f":"002467752000014678864100136899986310147999998521247999999741258999999852258999999853358999999863368999999964369999999964358999999964247999999964136899999853014689999742001468998631000257997420"},{"c":"0","a":0.667,"f":"013689973100125789985210247999997520258999998731358999999852369999999963469999999964469999999964469999999964469999999964469999999964358999999964247999999964125899999853013589999742001379999631"},{"c":"0","a":0.667,"f":"001245531000012467752100014789975200025899987310025899998520136999999631147999999741147999999842248999999852258999999853247999999853136899999852014799999742012589998631001357887410000136775310"},{"c":"+","a":0.559,"f":"000000000000000000000000000001100000000123321000001246642000013578874100125899986310136899998520025799999631012589998631001368886310000135653100000012321000000000000000000000000000000000000000"},{"c":"+","a":0.559,"f":"000000000000000000000000000011110000000134431000012467763100124789985310136899998521147999999731136899999741014789998631001478987421000247864210000124531000000001110000000000000000000000000000"},{"c":"+","a":0.559,"f":"000000000000000000000000000000000000000011110000000134431000001367763100013689985200014799997410013689997410001478986310000247864200000124531000000001110000000000000000000000000000000000000000"},{"c":"2","a":0.588,"f":"013688742000014788864100025899986310025899998510025899998520015899999631014799999731013699999631013699998520014799997410025899997410025899997410026899998520026899998520014789987420013688886410"},{"c":"2","a":0.588,"f":"014799863100025899875210136999997410147999998631136999999741026899999741025899999741014899999741014899999631025899998520136999998520147999998520147999998631137999999731125899998631014799998520"},{"c":"2","a":0.588,"f":"002466521000013577642100014799875200014799997410014799998410014799998520003689998520002589998520002589997410013689996310014799986200014899986300015899997410014799997410013678876310002467665210"},{"c":"0","a":0.676,"f":"001366531000013578752100125899974200147999986310258999997410468999998631579999999741579999999853468999999864358999999975247999999964136899999853025899999741013689997520001357765210000135643100"},{"c":"0","a":0.676,"f":"002578752000014688863100136899986310358999997410469999998631579999999742579999999853579999999964579999999975579999999975468999999975258999999974136899999853024799998742012578886421001257764210"},{"c":"0","a":0.676,"f":"000234310000001466531000013688863100025899974100136999986310247999997410258999998520258999999631248999999742147999999852136899999852025899999741013689998521001468886310000235553100000012321000"},{"c":"5","a":0.594,"f":"013689985200014799986310025899997310025899996300036899996300036899997310025899997410025899998520014899998520014799998630014799998630025899998520026899997410026899986310014788874100012577763100"},{"c":"5","a":0.594,"f":"024899997310126899997410147999998520147999998410147999997410147999998520147999998631147999999741136899999741025899999741025899999741136999999741147999998631147999997410136899986210024799974100"},{"c":"5","a":0.594,"f":"002467763100002578874100014799985200014799985200014799985200014799985200014799996300014799997410003699997410002689997410002689997410013799997410014799986300014799985200012577763100001356542000"},{"c":"8","a":0.562,"f":"000247764200001368876310013689997410014799998520025899998520025899998520025899998520136899998631147999999741147999999741147999999741147999999741147999998631125899997410013578875210001368763100"},{"c":"8","a":0.562,"f":"001379986310012589987420024799998631136899999741147999999741147999999741147999999741147999999741147999999741147999999741147999999741147999999741147999999741136899998631124789986410012579975200"},{"c":"8","a":0.562,"f":"000135542100000246764100001478986310013689997410014799997410014799997410014799997410014899998410025899998520025899998520025899998520025899998520025899997410013689986310001367763100000246532000"},{"c":"6","a":0.613,"f":"001368974200002478986310014789998631126899999741147999999741248999998631258999998620358999999631258999999741248999999742147999999842147999999842136899999741024799998521012578986310001368974200"},{"c":"6","a":0.613,"f":"002589997410013689998521125899999742247999999852258999999852358999999842358999999742358999999852358999999852358999999853358999999853258999999853247999999852136899999742014789998521002589997410"},{"c":"6","a":0.613,"f":"000135642100001357764210012589987410014799998520025899998520136899998410147999997410147999998510147999998520136899998520025899998631025899998631014799998520013689987410001357764210000135642100"},{"c":"9","a":0.613,"f":"002479974200013689986310014799997410136899998520147999999631258999999741258999999852248999999852147999999853147999999852137999999742136899998631025899998520014799986310013689874100002479852000"},{"c":"9","a":0.613,"f":"014799997310014799997410136899998631247999999741258999999852358999999852358999999853358999999853258999999853258999999853258999999852248999999742147999998631136899997420014799985210013799974100"},{"c":"9","a":0.613,"f":"001246642000001367763100013689986200014799997410025899998510136999998520137999999631136899999741025899999741025899999741025899998631014899997410014799986310002689974200001367752100000246631000"},{"c":"6","a":0.581,"f":"001258985200012478986310014789997410136899998520147999998520147999998520147999998520147999998520147999998631147999999741147999999741147999999741137999998621125899987410013589974200001479963100"},{"c":"6","a":0.581,"f":"002479997410013689998520136899998631147999999741147999999741147999999631147999999631147999999741147999999741147999999741147999999741147999999741147999999731136899998521014789986310002589985200"},{"c":"6","a":0.581,"f":"000125642100001356764100013578986310014799997410025899997410025899996310025899996310025899997410025899998410025899998520025899998520025899998520025899997410013689985210001367753100000246631000"},{"c":"9","a":0.545,"f":"002579874200013689886310025899998520136899998520137999999631147999999741147999999741137999999741036899999741025899999741025899999741025899999741025899998631014799997410013688875210002467763100"},{"c":"9","a":0.545,"f":"013699986310024799987521136899999731137999999741147999999741147999999741147999999741147999999741147999999741147999999741147999999741147999999741137999999741136899998621024789986310013689975200"},{"c":"9","a":0.545,"f":"001357642100002478764200013689986310014799997410025899998510025899998520025899998520025899998520014899998520014799998520014799998520014799998520014799997410013689986310001467753100001246532000"},{"c":"0","a":0.606,"f":"000257753100001368875310013689997420014799998631136899999741147999999742248998889852248987689852247987679852147998789852147999999741136999998631025899998520014799997410013678875200002467764100"},{"c":"0","a":0.606,"f":"001378875310012589987420014799998631136899999742247999999852258999999853358999999853358998889853358998889853358999899853258999999852258999999742147999999631136899998520024789987410013689986310"},{"c":"0","a":0.606,"f":"000135431000001256653100001479986310013689997410014799998520025898888520136887678631136885468741025885468741025886578631025898888520015899997410014799996310013689985200001467763100001245642000"},{"c":"8","a":0.606,"f":"000246763100001367875210001479997420013689998631014799999741025899999741025899999741025899999741026899999842147999999852258999999853358999999852358999999742258999998631246889987420135689986310"},{"c":"8","a":0.606,"f":"001368985200001478986410013689998631024799999742136899999852147999999853147999999853147999999853247999999853258999999853258999999853358999999853358999999852358999999742247899998631247899998420"},{"c":"8","a":0.606,"f":"000124542000000146764100001368986310002479997410013689998520014799998520014799998520014799998520014799998631136899999741247999999741258999999741358999998631247899997520135678875310112467764100"},{"c":"1","a":0.353,"f":"000135420000000257631000001479852000001589852000002589852000001589852000001479852000001479852000001369863000001369974100001479984100001479985200001479985200001479985100001368874100000258863100"},{"c":"1","a":0.353,"f":"000257631000001368752000002589973100002589974100002589974100002589974100002589974100002589974100001489984100001489985200002589985200002589985200002589985200002589985200001479985200001479974100"},{"c":"1","a":0.353,"f":"000023310000000135420000000258731000001369741000001479741000001369741000000258741000000258741000000148841000000148852000000258863000000258974100000258974100000258963100000147752000000135631000"},{"c":"2","a":0.559,"f":"000257775200001368886310002589998520013699998520014799999631014799999741014799998631013689998520002589997410002589996310013699997310025899998520036899998520026899998620014799998520013699997410"},{"c":"2","a":0.559,"f":"001479997310002589998521014799999731015899999741025899999741026899999741025899999741014799998631013699998520014799998520025899998520136899998631147999999741147999999741136899999731025899999631"},{"c":"2","a":0.559,"f":"000135653100000257775200001479997310001589997410002589998510002689998520002589997410001479986310001379985200001479985200002589985200013689986310014799997410014799997410013688886310002477775310"},{"c":"0","a":0.618,"f":"000257852000001478874100013689986310014799998520025899998631136999999741147998889741247987789842258987789852258998899842147999999741136999998631025899998520013689986310001478874200000258863100"},{"c":"0","a":0.618,"f":"001479974100012589985210024799997420136899998631147999999742258999999852258999999853358999999853358999999853358999999853258999999852258999999742147999998631125899998520013589986310001479985200"},{"c":"0","a":0.618,"f":"000136641000001257752100002579975200013689986310014799997410015898898520025887788520026885578631136985578631136987788631025899998520015899997410014799986310002589985200001357763100000146642000"},{"c":"1","a":0.324,"f":"000135420000000257631000001369741000001479852000001479852000000369852000000258852000000258852000000148852000000258862000000258963000000369974100001479974100001379973100000257752000000135531000"},{"c":"1","a":0.324,"f":"000257631000001368741000001479852000001479862000001479963100001479974100001369974100000268974100000258974100000268974100001369974100001479974100001479974100001479974100001368863100000257752000"},{"c":"1","a":0.324,"f":"000022210000000135420000000257631000000258741000000258741000000258841000000147841000000147841000000147841000000147851000000147852000000258852000000258852000000257752000000135531000000112211000"},{"c":"5","a":0.559,"f":"013689986310014799997410025899998510026899998410026899997410036999998510036999998620025899999731015899999741014899999731014899999631015899998620014799997410013689986310001367763100000245542000"},{"c":"5","a":0.559,"f":"025899998420136899998520137999999631147999998630147999998520147999998630147999999731137999999741136999999741026899999741036999999741136999999731026899998631014799997410012578875210001367763100"},{"c":"5","a":0.559,"f":"002467764100013688875200014799996310014799986300014899985200015899986300015899997410014799998520013699998520003689998520003699998510013699997410003689986310001478874200001245542100000122221000"},{"c":"2","a":0.529,"f":"000257764100001368875200002589997410003799998410014799998520013799998520002689998510002589997410002589996300003699996300014799996300014899997410015899998520014799998410013588886310002468875200"},{"c":"2","a":0.529,"f":"001379985200002589986310013799998410014799998520025899998520015899998520013799998520003699998520003699997410014799997410015899997410025899998510025899998520025899998520014789997410002689997310"},{"c":"2","a":0.529,"f":"000135542100001257764100001479986200002589997310002699997410002589997410001479997310001368996300001479985200002589985200002699985200003799996300014799997410003689997310002467775200001246653100"},{"c":"0","a":0.588,"f":"000246532000001367763100002689985200013799997310014899997410126899998520137988888631147986789741147987689741137988889631136899998520025899997410014799997310013689985200001367763100000235542000"},{"c":"0","a":0.588,"f":"001367763100002578875200013799997310025899998410136899998520147999999631147999999741147998899741147998899741147999999741147999999741147999998631126899997410014799996310002578875200001367763100"},{"c":"0","a":0.588,"f":"000123321000001245542100001478874100002689986200003799996300014798897310025886687410025874478520025874478520025886687510014898897410014799996300003699985200002478874100001245542100000122221000"},{"c":"+","a":0.529,"f":"000000000000000000000000000012210000000145531000001468763100013689986310025899998510025899998520025899998520014799987310012578874200001246642100000123211000000000000000000000000000000000000000"},{"c":"+","a":0.529,"f":"000000000000000011100000000124310000001257642100012589874210014799987410025899998520025899998520025899998520025899997410013689986310001467763100000134431000000011110000000000000000000000000000"},{"c":"+","a":0.529,"f":"000000000000000000000000000011100000000124310000001257642100002589874200014799987310014899997410014799997410013689985200001467753100000134431000000011110000000000000000000000000000000000000000"},{"c":"2","a":0.529,"f":"002478985200002589986310014799997410014899998520025899998520025899998520014799998510013699997410013699997310014799996310025899997310025899998510025899998520025899998520025899997410014799986410"},{"c":"2","a":0.529,"f":"013699997410014799997410025899998520025899998520025899998520025899998520025899998520015899998520014899998410025899997410025899998510025899998520025899998520025899998520025899998520025899998520"},{"c":"2","a":0.529,"f":"001357763100001468875200002689997310013799997410014799997410014799997410013689997410002589996300002589985200002689985200014799986200014799997410014899997410014899997410013688886310013577775210"},{"c":"1","a":0.353,"f":"000134310000001256520000001478741000002589851000002589852000001489852000001479852000001369852000000258863000000258974100000258984100001369985200001479985200001489985200001478974100001368974100"},{"c":"1","a":0.353,"f":"000256520000001367631000002589852000002589963100002589974100002589974100002589974100001589974100001479984100001479985200001479985200001589985200002589985200002589985200002589985200001479985200"},{"c":"1","a":0.353,"f":"000012100000000134310000000257520000001478631000001479741000000368741000000258741000000158741000000147841000000147852000000147863000000258974100000368974100000368974100000257863100000136752000"},{"c":"6","a":0.606,"f":"002467763100013678875310126899998521147999998631258999998631258999998520358999998520358999999631358999999741358999999842358999999852258999999742247999998631136899997410014678875210002467763100"},{"c":"6","a":0.606,"f":"013689985200125789986410247999998631258999999742358999999842358999999741358999999742358999999852358999999852358999999853358999999853358999999852258999999742247999998631125789986310013689975200"},{"c":"6","a":0.606,"f":"001245542000012467764100014789986310025899997410136999998410147999997410147999997410147999998510147999998520147999998631147999999631147999998631136899997410024789986310012467753100001245532000"},{"c":"0","a":0.636,"f":"001379974100012589986210125899997410137999998631147999999741147999999741147999999741248999999742258999999852258999999852248999999742147999999631125899998520013689997410002478985210001368974100"},{"c":"0","a":0.636,"f":"002589985200014789987410136899998631258999999742358999999852358999999853358999999853358999999853358999999853358999999853358999999852258999999852137899999741025799998621013689987410001479985200"},{"c":"0","a":0.636,"f":"000257763100001468874100013689986310025899997410025899998520025899998520025899998520136899998520147999999631147999999741136899998631025899998520014799997410002589986300001367874100000246753100"},{"c":"7","a":0.529,"f":"013689985200014799986310025899998410014799998520012589998510001368997410000148996300000258985200001368974100001479863100002589742000002588631000002588520000001476310000001243200000000111100000"},{"c":"7","a":0.529,"f":"014899997310025899997410025899998520025899998520013689998520002479998510000268997410001368996300001479986200002689984100003699863100003699842000003698631000002587520000001355310000000233200000"},{"c":"7","a":0.529,"f":"002477764100013688875200014799997310013689997410002478997310000147996200000026885200000136874100000257863100001368852000001478631000001478520000001477310000001255200000000122100000000000000000"},{"c":"0","a":0.647,"f":"001367752000002478864100013699986310014799998520025899998631136999999742247999999842258999999742258999999741247999999741136999999741025899998621014899997410013689985200002467752100001245531000"},{"c":"0","a":0.647,"f":"002479973100013689985200014799997410136899998631147999999742258999999852258999999853358999999853358999999853258999999853258999999852147999999742136899998521025899986310013678864100002467752000"},{"c":"0","a":0.647,"f":"000235531000001357752100002589985200003699997310014799998520025899998631136899998631147999998520147999998520136899998520025899998520014799997410013799986310002578864100001345531000000122210000"},{"c":"2","a":0.559,"f":"000246752000001468863100013689986310014799997520025899998631014799999731013689999731002589998520013689997410014799986300036899996300137999997410137999997410136899997410024789986310013578975200"},{"c":"2","a":0.559,"f":"001368873100012579985210014799997410026899998631136999999731136899999741025899999741014799999731025899998520136899998410137999998410147999998520147999998520137999998520136899997410024799996310"},{"c":"2","a":0.559,"f":"000124531000001246652100001479974200003689986310013799997410013689998520002589998520001479997410002589986210013689984100014799984100025899985200025899985200014799985200013578874100001357753100"},{"c":"9","a":0.636,"f":"001256631000012467752100024799975200136899987410247999998621258999999741258999999842258999999852147999999853136899999853025899999852025899998631015899997420014799986310002588863100001478752000"},{"c":"9","a":0.636,"f":"002478752000014688874100136899986310247999998521258999999742358999999852358999999853358999999853258999999853248999999853147999999852147999999742136999998631025899997410013689985210002589973100"},{"c":"9","a":0.636,"f":"000124321000001356531000013688863100025899985210136899997410147999998520147999998631136999999741025899999741014899999741014799999731014799998521013699986310002589974100001367752100000256531000"},{"c":"0","a":0.636,"f":"000136752000001257864100012589986310014799998631025899999742136999999852247999999853258999999853258999999853258999999853247999999853137999999852125899999742013689998631001478876310000258764200"},{"c":"0","a":0.636,"f":"000257874100001468985310013689998521126899999742147999999852258999999853258999999853358999999853358999999853358999999853358999999853258999999853137899999852025799999742012589987521001479986310"},{"c":"0","a":0.636,"f":"000023431000000136653100001368985210002689997410014799998631025899999741136899999741147999999741147999999741136999999741025899999741025899999741013789998631002579987420001357764210000146642100"},{"c":"5","a":0.576,"f":"002478752000013688863100126899984100147999985200147999985200136999985200025899986310025899997520025899998631025899999741136999999741147999998631147999998520147999986310146888763100136777641000"},{"c":"5","a":0.576,"f":"013689973100125799975200137999986310147999997410147999997410147999997410147999998520147999998631147999999741147999999741147999999741147999999741147999998631147999997420147999875210147999853100"},{"c":"5","a":0.576,"f":"001256531000012467752000014799963100025899974100025899974100015899974100014799985200014799986310014799997410014799998520125899998520137999997410147999986310147999874100136777642000124665421000"},{"c":"1","a":0.364,"f":"000135420000001256531000001479741000002589852000002589963100001489974100001479974100001479974100001479974100001479974100001479984100001589985200002589985200001479985200001368863100000258852000"},{"c":"1","a":0.364,"f":"000257631000001368742000002589863100002589974100002589985100002589985200002589985200002589985200002589985200002589985200002589985200002589985200002589985200002589985200001479974100001369963100"},{"c":"1","a":0.364,"f":"000012110000000134310000000257631000001479741000001479851000000368852000000258852000000258852000000258852000000258852000000258863000001369974100001479974100001368973100000247752000000136631000"},{"c":"2","a":0.576,"f":"001479863100002589875200013699997310014799998520025899998520014799998520013689998520002589998510002589997410013689997410014799997410136899998410147999998520147999998520126899998520024799998410"},{"c":"2","a":0.576,"f":"002589985200013689986310025899998521136899999731137999999741136899999741014799999741003699999631013699998520014799998520136899998520147999998631147999999741147999999741137999999741136999999731"},{"c":"2","a":0.576,"f":"001357642000001478763100002589985200003699997310013799997410013689997410002589997410001479996310001479986200002589985200013689986200014799996300025899997410025899997410014788886310013577775310"},{"c":"0","a":0.636,"f":"001368985200001478987410013689998631014799999742025899999852136899999853147999999853247999999853247999999853147999999853147999999853136899999852025899999742013689998521002478875310001357763100"},{"c":"0","a":0.636,"f":"001479997410012689998521014799999742136899999852147999999853248999999853258999999853358999999853358999999853358999999853258999999853247999999853136899999852025799998631013689987410001479985200"},{"c":"0","a":0.636,"f":"000246764100001367875210002589997410003689998631014799999741014899999741025899999741026899999741026899999741025899999741025899999741014899999741013799998621002589986410001357764200000135542100"},{"c":"1","a":0.314,"f":"000012210000000134421000000257741000001369841000001379852000000369852000000268852000000258852000000258862000000258963100000268974100001369974100001379974100001357763100000124431000000011211000"},{"c":"1","a":0.314,"f":"000135421000000246641000001368852000001479852000001479963000001479974100001479974100001479974100001479974100001479974100001479974100001479974100001479974100001368873100000245652000000123431000"},{"c":"1","a":0.314,"f":"000011100000000023310000000146520000000258741000000258741000000258741000000158841000000148841000000148852000000148852000000258852000000258852000000258852000000135641000000012321000000000110000"},{"c":"5","a":0.543,"f":"013689863100014799875200025899986300025899996300025899996300025899997310025899997410025899998510025899998520014899998520014899998520014899998520014899998410013789985310002467753100001245531000"},{"c":"5","a":0.543,"f":"014799985200015899986310025899997410025899997410025899997410025899998410025899998520025899998520025899998520025899998520025899998520025899998520025899998520025899987410013678864210001467742100"},{"c":"5","a":0.543,"f":"001467642000002578763100014799974100014799984100014899984100014899985200014899986300014799997310014799997410014799998410014799998410014799997410013799986310002578864200001245531000000122210000"},{"c":"2","a":0.514,"f":"000136642000001257763100002479985200013689997310014799998510013699998520002689998520002689998520003699998410014799997410014899997410025899997410025899997410014799997310013588885200001478874100"},{"c":"2","a":0.514,"f":"000258863100001368874200013689986310014799998410025899998520015899998520014799998520014799998520014899998520025899998520025899998520025899998520025899998520025899998520013789987310002589985200"},{"c":"2","a":0.514,"f":"000024421000000146642000001368874100002589985200002589997310002589997410002589997410001589997410002589996300002589986200003699985200014799985200014799985200013689985200002478864100001356653100"},{"c":"0","a":0.571,"f":"000122221000001245542100001478874200002689986310014799998520136899999631147999999741147999999741147999999741136899999741025899999741014799998631012689998520001368986310000146764100000024542100"},{"c":"0","a":0.571,"f":"000135542000001357763100002589986310014799998520126899999631147999999741147999999741147999999741147999999741147999999741147999999741126899999741014789998631002479997520001257875210000136764100"},{"c":"0","a":0.571,"f":"000011110000000124431000001357763100002489985200013689997410014799998510025899998520025899998520025899998520014899998520014799998520003689998410001479997310001257875200000124542100000012321000"},{"c":"+","a":0.5,"f":"000000000000000000000000000011110000001234421000012467753100014799985210025899997410015899997410013689986310002478874100001246542000000112210000000000000000000000000000000000000000000000000000"},{"c":"+","a":0.5,"f":"000000000000000000000000000122210000001356542000013688874100025899986310025899998520025899998520014799997410013689985210001467753100000134421000000011110000000000000000000000000000000000000000"},{"c":"+","a":0.5,"f":"000000000000000000000000000000000000000122210000001356542000013688874100014799986310013699986310002589985200001367752100000134421000000011110000000000000000000000000000000000000000000000000000"},{"c":"2","a":0.559,"f":"001479984200002589986310014799997410014799998631013689999741002589999741001379998631001379997410012589986310014799986200136899996310137999997410136899998520024799997410012589985210001379974100"},{"c":"2","a":0.559,"f":"002589996310013689997420025899998631025899999741025899999741013689999741002589999741002589998631014789998520126899997410147999998520147999998631147999999731136899998631014789997410002589986310"},{"c":"2","a":0.559,"f":"000257763100001368874200002589986310002589997410002589998520001369998520000258997410000258986310001479985200013689974100014799985200025899986310014799997310013689986200001468863100000257752000"},{"c":"1","a":0.353,"f":"000134310000000256521000001478741000001489863000001489974100001479974100001479974100001379974100001479974100001479974100002589974100002589985100002589985200001479974100001257753100000135531000"},{"c":"1","a":0.353,"f":"000256520000001367641000002589863100002589974100002589985200002589985200002589985200002589985200002589985200002589985200002589985200002589985200002589985200002589985200001368874100000257753100"},{"c":"1","a":0.353,"f":"000012100000000134310000000257631000000368741000000368852000000258852000000258852000000258852000000258852000000368852000001479852000001479963100001479973100000258852000000135531000000012210000"}];
+(() => {
+  const LKEY = 'aw189-epac-glyphs';
+  const learned = () => { try { const v = JSON.parse(localStorage.getItem(LKEY) || '[]'); return Array.isArray(v) ? v : []; } catch (e) { return []; } };
+  Scan.setTemplates(SCAN_TPL.concat(learned()));
+  const enc = (f) => Array.from(f, (v) => String.fromCharCode(48 + Math.round(v * 9))).join('');
+  let target = null, last = null;
+  const sheet = $('sheet');
+  function openSheet() { sheet.hidden = false; $('sheet-busy').hidden = false; $('sheet-err').hidden = true; $('sheet-body').hidden = true; $('sheet-ok').hidden = true; document.body.style.overflow = 'hidden'; }
+  function closeSheet() { sheet.hidden = true; document.body.style.overflow = ''; $('scanfile').value = ''; }
+  function fail(m) { $('sheet-busy').hidden = true; $('sheet-err').textContent = m; $('sheet-err').hidden = false; }
+  document.addEventListener('click', (e) => {
+    const b = e.target.closest('.scanbtn'); if (!b) return;
+    target = attempts.findIndex((a) => a.node.contains(b));
+    $('scanfile').click();
+  });
+  $('sheet-retake').addEventListener('click', () => { $('scanfile').value = ''; $('scanfile').click(); });
+  $('sheet-cancel').addEventListener('click', closeSheet);
+  $('scanfile').addEventListener('change', async () => {
+    const file = $('scanfile').files && $('scanfile').files[0]; if (!file) return;
+    openSheet();
+    await new Promise((r) => setTimeout(r, 30));
+    let img;
+    try { const url = URL.createObjectURL(file); img = new Image(); img.src = url; await img.decode(); setTimeout(() => URL.revokeObjectURL(url), 1000); }
+    catch (e) { return fail('That photo could not be opened. Try again.'); }
+    let r;
+    try { r = Scan.analyse(img); } catch (e) { return fail('The photo could not be read (' + (e && e.message) + '). Enter the values by hand.'); }
+    if (r.error) return fail(r.error + ' Tips: hold the phone square to the display, fill the frame with the screen, and avoid reflections.');
+    last = r;
+    const LBL = { TQ: 'TQ %', ITT: 'ITT °C', NG: 'NG %', IAS: 'IAS kt', ALT: 'ALT ft', OAT: 'OAT °C' };
+    let h = '<div></div><div class="hd">ENG 1</div><div class="hd">ENG 2</div>';
+    for (const k of Scan.ROWS) {
+      if (k === 'IAS' && MODE === 'hover') continue;
+      h += `<div class="rk">${LBL[k]}</div>`;
+      r.eng.forEach((e, i) => {
+        const row = e.rows[k], chk = !row.ok || (row.q || 0) > 0.85;
+        h += `<div class="scell${chk ? ' chk' : ''}"><img alt="" src="${Scan.cropURL(e, k)}"><input data-e="${i}" data-k="${k}" type="text" inputmode="decimal" value="${esc(row.text)}"></div>`;
+      });
+    }
+    $('scangrid').innerHTML = h;
+    $('sheet-use').textContent = `Fills the ${ATT_NAMES[target].toLowerCase()} with the higher TQ and both ITTs, and the flight details with ALT (as P ALT), OAT${MODE === 'hover' ? '' : ' and IAS'} from ENG 1.`;
+    $('sheet-busy').hidden = true; $('sheet-body').hidden = false; $('sheet-ok').hidden = false;
+  });
+  $('sheet-ok').addEventListener('click', () => {
+    const val = (i, k) => { const el = $('scangrid').querySelector(`input[data-e="${i}"][data-k="${k}"]`); return el ? el.value.trim().replace(',', '.') : ''; };
+    const n = (s) => { const v = parseFloat(s); return Number.isFinite(v) ? v : null; };
+    const tq1 = n(val(0, 'TQ')), tq2 = n(val(1, 'TQ'));
+    const v = { tq: tq1 === null ? tq2 : tq2 === null ? tq1 : Math.max(tq1, tq2), itt1: n(val(0, 'ITT')), itt2: n(val(1, 'ITT')), alt: n(val(0, 'ALT')) ?? n(val(1, 'ALT')), oat: n(val(0, 'OAT')) ?? n(val(1, 'OAT')), ias: n(val(0, 'IAS')) ?? n(val(1, 'IAS')) };
+    if ([v.tq, v.itt1, v.itt2, v.alt, v.oat].some((x) => x === null)) { $('sheet-err').textContent = 'Fill in TQ, both ITTs, ALT and OAT first.'; $('sheet-err').hidden = false; return; }
+    // learn from the confirmed values so this phone reads the display better next time
+    try {
+      const add = [];
+      last.eng.forEach((e, i) => Scan.ROWS.forEach((k) => {
+        const s = val(i, k); if (!s) return;
+        const chars = s.replace(/[.\-]/g, '').split('');
+        const gl = e.rows[k].items.filter((it) => it.f);
+        if (gl.length !== chars.length) return;
+        gl.forEach((it, j) => add.push({ c: chars[j], a: +it.a.toFixed(3), f: enc(it.f) }));
+      }));
+      const all = learned().concat(add).slice(-900);
+      localStorage.setItem(LKEY, JSON.stringify(all));
+      Scan.setTemplates(SCAN_TPL.concat(all));
+    } catch (e) {}
+    const a = attempts[target].node;
+    a.hidden = false;
+    a.querySelector('.tq').value = v.tq; a.querySelector('.itt1').value = v.itt1; a.querySelector('.itt2').value = v.itt2;
+    $('palt').value = v.alt; $('oat').value = v.oat;
+    if (MODE !== 'hover' && v.ias !== null) $('ias').value = v.ias;
+    closeSheet();
+    recalc();
+    a.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+})();
 </script>
 <script>if ('serviceWorker' in navigator) { window.addEventListener('load', () => { navigator.serviceWorker.register('sw.js').catch(() => {}); }); }</script>
 </body>
